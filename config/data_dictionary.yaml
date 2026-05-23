@@ -1,0 +1,107 @@
+meta:
+  project: Agentic BI - Olist
+  database_default: olist_agentic_bi
+  gmv_definition: "订单明细（order_items）上 SUM(price)+SUM(freight_value)，再按粒度聚合。"
+  fulfillment_on_time_definition: >
+    orders 表：order_delivered_customer_date <= order_estimated_delivery_date 记为准时；
+    仅统计同时具备 purchase / delivered_customer / estimated 时间戳的记录。
+
+tables:
+  orders:
+    description: "订单主表。"
+    granularity: order_id
+    primary_key: [order_id]
+    key_columns:
+      order_id: { type: VARCHAR(32), desc: "订单号" }
+      customer_id: { type: VARCHAR(32), desc: "客户 ID，关联 customers" }
+      order_status: { type: VARCHAR(32), desc: "订单状态" }
+      order_purchase_timestamp: { type: DATETIME, desc: "下单时间（GMV、趋势时间轴多用此字段）" }
+      order_estimated_delivery_date: { type: DATETIME, desc: "承诺送达日期" }
+      order_delivered_customer_date: { type: DATETIME, desc: "客户实际签收日期" }
+
+  order_items:
+    description: "订单行项目表。"
+    granularity: order_id + order_item_id
+    primary_key: [order_id, order_item_id]
+    key_columns:
+      order_id: { type: VARCHAR(32), desc: "订单号，关联 orders" }
+      seller_id: { type: VARCHAR(32), desc: "卖家 ID，关联 sellers" }
+      product_id: { type: VARCHAR(32), desc: "商品 ID，关联 products" }
+      price: { type: DECIMAL, desc: "商品单价（不含单列运费）" }
+      freight_value: { type: DECIMAL, desc: "本行分摊运费（与课件 GMV 定义一致时需与 price 相加）" }
+
+  products:
+    primary_key: [product_id]
+    key_columns:
+      product_category_name: { type: VARCHAR(128), desc: "葡萄牙语品类名（需 join 翻译表）" }
+      product_name_lenght: { type: SMALLINT, desc: "Kaggle 数据集列名为拼写 typo（原为 length）；与 CSV/库表一致勿改" }
+      product_description_lenght: { type: SMALLINT, desc: "同上，*_lenght 为原始字段名" }
+
+  customers:
+    primary_key: [customer_id]
+
+  sellers:
+    primary_key: [seller_id]
+
+  payments:
+    primary_key: [order_id, payment_sequential]
+
+  order_reviews:
+    primary_key: [review_id]
+    notes: ["同一订单可能有多条评论，分析评论与卖家关系时常与 order_items JOIN。"]
+
+  geolocation:
+    notes: ["按 zip 前缀冗余多行；地图绘制常需与各表邮编前缀对齐。"]
+
+  product_category_name_translation:
+    primary_key: [product_category_name]
+
+materialized_aggregates:
+  notes: >
+    MySQL 层使用同名物理表 mv_* 存储一次性汇总结果；
+    NL2SQL/Agent 仍可将其视为「预聚合视图」。
+
+  mv_monthly_sales:
+    grain: YEAR-MONTH (order_purchase_timestamp)
+    use_for:
+      - 月度 GMV / 销售额趋势
+      - 环比增长
+      - 与未来预测（常与 models 的周度预测对照说明）
+    columns:
+      year_month:
+        desc: >-
+          '%Y-%m' 格式的月份键；手写 SQL 时建议写成 `year_month`（含反引号），
+          避免与 MySQL 保留词 YEAR_MONTH 产生词法歧义。
+      total_gmv: { desc: "当月 SUM(price+freight)，按 DISTINCT order_id 口径汇总后写入" }
+      total_orders: { desc: "去重订单数" }
+      avg_basket: { desc: "客单价近似 = total_gmv / total_orders" }
+      total_freight: { desc: "当期运费总和" }
+
+  mv_state_sales:
+    grain: YEAR-MONTH × customer_state
+    use_for: ["省级销售对比", "区域排名", "地理热力数据源"]
+    columns:
+      customer_state: { desc: "客户所在州二位码（巴西）" }
+      unique_customers: { desc: "按 customer_unique_id 去重计数" }
+
+  mv_category_sales:
+    grain: YEAR-MONTH × English category
+    use_for: ["品类销售结构", "Top 品类"]
+
+  mv_delivery_perf:
+    grain: YEAR-MONTH × customer_state
+    use_for: ["送达时效诊断", "延迟严重省份", "准时率"]
+    columns:
+      avg_delivery_days: { desc: "DATEDIFF(签收,下单) 的均值" }
+      on_time_rate: { desc: "0~1；准时订单占比均值（按聚合组内算术平均）" }
+      delayed_orders: { desc: "延迟订单计数（签收晚于预估）" }
+
+  mv_seller_perf:
+    grain: YEAR-MONTH × seller_id
+    use_for: ["卖家 GMV / 差评监控", "高差评卖家筛查"]
+    columns:
+      avg_review_score: { desc: "该卖家相关订单的评论均分（先按订单聚评论再与订单行对齐）" }
+
+  mv_payment_dist:
+    grain: YEAR-MONTH × payment_type
+    use_for: ["支付方式偏好", "平均分期数"]

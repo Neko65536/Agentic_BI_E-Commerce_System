@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Kaggle CSV 体量较大，一般不提交仓库
+/data/raw/**/*.csv
+/data/clean/**/*.csv
+
+/outputs/**/*.png
+
+.idea/
+.vscode/
