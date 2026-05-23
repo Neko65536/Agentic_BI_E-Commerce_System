@@ -16,40 +16,32 @@
 
 ## 3. 安装依赖
 
-在项目根目录 `AgenticBI_Final_Olist/`：
+在项目根目录执行：
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ## 4. 配置数据库连接（任选其一）
 
-**方式 A — 环境变量（推荐）**
-
-PowerShell：
-
-```powershell
-setx MYSQL_HOST "127.0.0.1"
-setx MYSQL_PORT "3306"
-setx MYSQL_USER "root"
-setx MYSQL_PASSWORD "你的密码"
-setx MYSQL_DATABASE "olist_agentic_bi"
+```bash
+cp .env.example .env
 ```
-
-新开终端后生效。
-
-**方式 B：** 运行时 `db_init.py` 会交互询问密码。
+- 在 `.env` 中配置数据库连接信息
 
 ## 5. 执行流水线
 
 仍在项目根：
 
 ```bash
+source .venv/bin/activate
 python utils/data_cleaning.py
 python utils/db_init.py
 ```
 
-- 第一次会向 MySQL 创建库 `olist_agentic_bi`，执行 `utils/schema_ddl.sql`，`TRUNCATE` 各基表再导入清洗后的 CSV，然后执行 `utils/pre_aggregation.sql` 填满六张 `mv_*`。
+- 第一次会向 MySQL 连接的库，执行 `utils/schema_ddl.sql`，`TRUNCATE` 各基表再导入清洗后的 CSV，然后执行 `utils/pre_aggregation.sql` 填满六张 `mv_*`。
 - 若仅需空表：`python utils/db_init.py --ddl-only`
 
 ## 6. 性能对比（报告截图）
