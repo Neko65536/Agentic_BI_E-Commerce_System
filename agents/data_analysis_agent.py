@@ -30,6 +30,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from agents.llm_sql_generator import generate_sql_with_llm
+
 import pandas as pd
 from sqlalchemy import create_engine, text
 
@@ -98,7 +100,7 @@ WHERE order_purchase_timestamp IS NOT NULL
     return base, params
 
 
-def generate_sql(route: dict[str, Any]) -> SQLPlan:
+def generate_sql(route: dict[str, Any], question: str | None = None) -> SQLPlan:
     """
     根据路由结果生成 SQL。
 
@@ -279,13 +281,25 @@ FROM mv_payment_dist
             ),
         )
 
+    if question:
+        llm_plan = generate_sql_with_llm(question, route)
+
+        return SQLPlan(
+            sql=llm_plan["sql"],
+            params={},
+            source_tables=llm_plan["source_tables"],
+            used_pre_aggregate=llm_plan["used_pre_aggregate"],
+            strategy=llm_plan["strategy"],
+            note=llm_plan["note"],
+        )
+
     return SQLPlan(
         sql=None,
         params={},
         source_tables=route.get("fallback_tables", []),
         used_pre_aggregate=False,
         strategy="needs_llm_or_manual_sql",
-        note="该问题暂未命中规则模板，后续可交给 LLM 生成 SQL 或手写补充规则。",
+        note="该问题暂未命中规则模板，且未提供 question，无法调用 LLM 生成 SQL。",
     )
 
 
@@ -387,7 +401,7 @@ def analyze_question(question: str) -> dict[str, Any]:
     输入自然语言问题，输出结构化分析结果。
     """
     route = route_question(question)
-    plan = generate_sql(route)
+    plan = generate_sql(route, question)
 
     if plan.sql is None:
         return {

@@ -114,7 +114,7 @@ def data_analysis_node(state: BIAnalysisState) -> BIAnalysisState:
     """
     question = state["normalized_question"]
     route = state["route"]
-    plan = generate_sql(route)
+    plan = generate_sql(route, question)
 
     if plan.sql is None:
         return {
