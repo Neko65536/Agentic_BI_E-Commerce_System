@@ -24,12 +24,40 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 4. 配置数据库连接（任选其一）
+## 4. 配置环境变量
 
 ```bash
 cp .env.example .env
 ```
-- 在 `.env` 中配置数据库连接信息
+- 在 `.env` 中配置必要环境变量
+
+### 数据库配置
+
+```bash
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=your-username
+MYSQL_PASSWORD=your-password
+MYSQL_DATABASE=your-database-name
+```
+
+### LLM 配置
+
+```bash
+LLM_PROVIDER=llm-provider-name
+LLM_BASE_URL=https://api.example.com/api/v1
+LLM_API_KEY=llm-api-key
+LLM_MODEL=llm-model-name
+LLM_TEMPERATURE=0.6
+LLM_TIMEOUT_SECONDS=60
+```
+
+- 测试 `LLM` 可用性：
+
+```bash
+source .venv/bin/activate
+python -m utils.test_llm
+```
 
 ## 5. 执行流水线
 
