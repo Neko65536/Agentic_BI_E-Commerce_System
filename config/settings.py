@@ -6,6 +6,7 @@
 import os
 from pathlib import Path
 from urllib.parse import quote_plus
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,20 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")  # 建议本机设置环境变量，勿提交密码到 git
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "olist_agentic_bi")
+
+@dataclass(frozen=True)
+class LLMSettings:
+    provider: str = os.getenv("LLM_PROVIDER", "zhipu")
+    base_url: str = os.getenv(
+        "LLM_BASE_URL",
+        "https://open.bigmodel.cn/api/paas/v4",
+    )
+    api_key: str = os.getenv("LLM_API_KEY", "")
+    model: str = os.getenv("LLM_MODEL", "glm-4.7-flash")
+    temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+    timeout_seconds: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+
+LLM_SETTINGS = LLMSettings()
 
 # 生成 SQLAlchemy 连接 URL，支持传入密码参数（用于测试）
 def sqlalchemy_url(password: str | None = None) -> str:
