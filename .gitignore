@@ -1,14 +1,28 @@
+# system
+.DS_Store
+
+# python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .env
+.pytest_cache/
 
 # Kaggle CSV 体量较大，一般不提交仓库
 /data/raw/**/*.csv
 /data/clean/**/*.csv
 
+# png
 /outputs/**/*.png
 
+# logs
+logs/
+log/
+*.log
+
+# IDE
 .idea/
 .vscode/
+.cursor/
+.trae/
