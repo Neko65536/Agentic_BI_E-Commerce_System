@@ -26,7 +26,7 @@ class LLMClient:
             api_key=LLM_SETTINGS.api_key,
             base_url=LLM_SETTINGS.base_url,
             timeout=LLM_SETTINGS.timeout_seconds,
-            max_retries=2,
+            max_retries=1,
         )
 
     def chat_text(self, messages: list[dict[str, str]]) -> str:

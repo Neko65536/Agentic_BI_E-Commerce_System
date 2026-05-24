@@ -15,7 +15,7 @@
 
 from agents.orchestrator_agent import run_orchestrator
 
-result = run_orchestrator("评价分数最低的卖家有哪些？")
+result = run_orchestrator("付款方式分布如何？")
 
 print(result["final_answer"])
 print()
