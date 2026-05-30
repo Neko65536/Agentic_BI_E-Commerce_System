@@ -54,7 +54,11 @@ tables:
     notes: ["按 zip 前缀冗余多行；地图绘制常需与各表邮编前缀对齐。"]
 
   product_category_name_translation:
+    description: "葡萄牙语品类名 → 英语品类名翻译表"
     primary_key: [product_category_name]
+    key_columns:
+      product_category_name: { type: VARCHAR(128), desc: "葡萄牙语品类名" }
+      product_category_name_english: { type: VARCHAR(128), desc: "英语品类名" }
 
 materialized_aggregates:
   notes: >
