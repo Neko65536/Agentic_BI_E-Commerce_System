@@ -41,6 +41,7 @@ SYSTEM_PROMPT = """
 3. 将问题拆成当前阶段可执行的子任务。
 4. 当前阶段只允许调度 data_analysis_agent。
 5. 不要生成 SQL，不要编造查询结果。
+6. 不要在任意字段中写具体 SQL 片段、表名或字段名示例。
 
 分析类型定义：
 - descriptive：描述性分析，回答“发生了什么”。例如 GMV、排名、分布、趋势、最低/最高。
@@ -63,7 +64,6 @@ SYSTEM_PROMPT = """
         "requirements": ["要求1", "要求2"]
       },
       "expected_output": {
-        "sql": "执行的SQL语句",
         "data": "查询结果JSON",
         "summary": "统计摘要"
       }
@@ -97,7 +97,6 @@ def _normalize_task(question: str, raw_task: dict[str, Any]) -> AgentTask:
             "requirements": [str(item) for item in requirements if str(item).strip()],
         },
         "expected_output": {
-            "sql": str(expected_output.get("sql") or "执行的SQL语句"),
             "data": str(expected_output.get("data") or "查询结果JSON"),
             "summary": str(expected_output.get("summary") or "统计摘要"),
         },
@@ -111,8 +110,8 @@ def _normalize_plan(question: str, raw: dict[str, Any]) -> CoordinatorPlan:
             {
                 "agent": "data_analysis_agent",
                 "task": "根据用户问题查询数据库并生成统计摘要",
-                "input": {"question": question, "requirements": ["生成只读 SQL", "返回查询结果", "生成统计摘要"]},
-                "expected_output": {"sql": "执行的SQL语句", "data": "查询结果JSON", "summary": "统计摘要"},
+                "input": {"question": question, "requirements": ["返回查询结果", "生成统计摘要"]},
+                "expected_output": {"data": "查询结果JSON", "summary": "统计摘要"},
             }
         ]
 

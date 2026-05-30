@@ -28,7 +28,6 @@ class TaskInput(TypedDict):
 
 
 class ExpectedOutput(TypedDict):
-    sql: str
     data: str
     summary: str
 

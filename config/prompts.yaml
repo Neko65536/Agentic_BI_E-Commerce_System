@@ -165,3 +165,18 @@ data_analysis_agent:
     - "平均分期数必须使用加权平均：SUM(avg_installments * total_transactions) / SUM(total_transactions)。"
     - "支付方式最受欢迎默认按 total_transactions 排序。"
     - "延迟最严重州默认按 delayed_orders 降序排序。"
+    - "注意 mv_* 视图的声明粒度（grain）是否与用户问题所需粒度一致。若视图粒度比问题粒度更细（典型情形：视图包含 YEAR-MONTH 时间维度，而问题问的是跨时间周期的整体分布/排名/占比），不能直接在视图的明细行上计算汇总指标或窗口占比，必须先 GROUP BY 目标维度聚合消除多余粒度。"
+
+  distribution_grain_mismatch:
+    description: >
+      常见错误模式：mv_* 视图的粒度是「YEAR-MONTH × 业务维度」，但用户问题只关心
+      「业务维度的整体分布」，不区分月份。LLM 倾向于直接对原粒度行使用窗口函数算占比，
+      导致同一业务维度值被拆到多行，占比计算错误。
+    correct_pattern: >
+      先 GROUP BY 业务维度，用 SUM() 聚合度量值（如 total_transactions、total_gmv），
+      消除时间粒度后再计算占比或排名。若问题指定了年份，先 WHERE 过滤再聚合。若问题
+      未指定时间范围，默认全期汇总。
+    affected_views:
+      - "mv_payment_dist (YEAR-MONTH × payment_type) → 支付方式整体分布"
+      - "mv_category_sales (YEAR-MONTH × product_category_english) → 品类整体结构"
+      - "mv_state_sales (YEAR-MONTH × customer_state) → 各州整体排名"

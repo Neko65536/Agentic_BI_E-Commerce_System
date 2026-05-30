@@ -25,3 +25,10 @@ print()
 print("前 5 行:")
 for row in result["rows"][:5]:
     print(row)
+
+print("\n" + "=" * 80)
+result_year = run_orchestrator("2018年付款方式分布如何？")
+print(result_year["final_answer"])
+print()
+print("SQL:")
+print(result_year["sql"])

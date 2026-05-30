@@ -116,6 +116,63 @@ def detect_view_name(sql: str) -> str | None:
     return match.group(1) if match else None
 
 
+# 有已知粒度不一致风险的视图：粒度为 YEAR-MONTH × 维度，
+# 但用户的问题通常只问维度的分布（忽略时间）。
+GRAIN_MISMATCH_VIEWS: dict[str, dict[str, str]] = {
+    "mv_payment_dist": {
+        "dimension": "payment_type",
+        "metric": "total_transactions",
+    },
+    "mv_category_sales": {
+        "dimension": "product_category_english",
+        "metric": "total_gmv",
+    },
+    "mv_state_sales": {
+        "dimension": "customer_state",
+        "metric": "total_gmv",
+    },
+}
+
+
+def validate_distribution_grain(sql: str) -> str | None:
+    """
+    检测 SQL 是否在细粒度 mv_* 视图上计算占比，但未先聚合到业务维度。
+
+    常见错误：SELECT dim, metric, ROUND(metric*100.0/SUM(metric) OVER(), 2)
+    FROM mv_xxx  — 没有 GROUP BY，错误原因：视图粒度为 YEAR-MONTH × dim，
+    每个 dim 值有多行（每月一行），直接窗口函数算出的占比不正确。
+
+    返回 None（校验通过）或错误消息。
+    """
+    normalized = re.sub(r"\s+", " ", sql.strip().lower())
+
+    # 查找 SQL 使用了哪个已知的粒度不一致风险视图
+    matched_view = None
+    matched_info = None
+    for view_name, info in GRAIN_MISMATCH_VIEWS.items():
+        if view_name in normalized:
+            matched_view, matched_info = view_name, info
+            break
+
+    if not matched_view:
+        return None
+
+    dim = matched_info["dimension"]
+
+    # 检测是否在未 GROUP BY 维度的情况下用窗口函数计算占比
+    has_over = bool(re.search(r"over\s*\(", normalized))
+    has_group_by_dim = bool(re.search(rf"group\s+by\s+.*\b{dim}\b", normalized))
+
+    if has_over and not has_group_by_dim:
+        return (
+            f"视图 {matched_view} 的粒度为 YEAR-MONTH × {dim}，"
+            f"不能直接在其明细行上用窗口函数计算占比。"
+            f"必须先 GROUP BY {dim} 用 SUM() 聚合后计算。"
+        )
+
+    return None
+
+
 def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
     """
     Ask the DataAnalysisAgent LLM to produce SQL and metadata.
@@ -165,10 +222,16 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
 
     client = LLMClient()
 
-    raw = client.chat_json([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ])
+    def _call_llm(extra_guard: str = "") -> dict[str, Any]:
+        guard_prompt = user_prompt
+        if extra_guard:
+            guard_prompt = f"{user_prompt}\n\n额外约束（必须满足）：\n{extra_guard}"
+        return client.chat_json([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": guard_prompt},
+        ])
+
+    raw = _call_llm()
 
     sql = validate_readonly_sql(str(raw.get("sql", "")))
     view_name = raw.get("view_name")
@@ -178,6 +241,35 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
         view_name = detect_view_name(sql)
 
     used_view = bool(raw.get("used_view")) or bool(view_name)
+
+    # 通用粒度校验：检测分布类查询是否在 YEAR-MONTH × 维度粒度的明细上计算占比
+    semantic_error = validate_distribution_grain(sql)
+    if semantic_error:
+        matched_view, matched_info = None, None
+        for vn, info in GRAIN_MISMATCH_VIEWS.items():
+            if vn in sql.lower():
+                matched_view, matched_info = vn, info
+                break
+        dim = matched_info["dimension"] if matched_info else "业务维度"
+        metric = matched_info["metric"] if matched_info else "度量值"
+
+        retry_raw = _call_llm(
+            f"你使用了 {matched_view} 但粒度错误。该视图粒度为 YEAR-MONTH × {dim}，"
+            f"计算整体占比时需先 GROUP BY {dim} 并用 SUM({metric}) 聚合，"
+            f"再基于聚合结果计算百分比。\n"
+            f"注意：year_month 是 MySQL 9.x 保留关键字，所有出现 year_month 的地方都必须加反引号(\`year_month\`)。"
+        )
+        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        view_name = retry_raw.get("view_name")
+        if view_name in ("", "null", "None"):
+            view_name = None
+        if not view_name:
+            view_name = detect_view_name(sql)
+        used_view = bool(retry_raw.get("used_view")) or bool(view_name)
+        semantic_error = validate_distribution_grain(sql)
+        if semantic_error:
+            raise ValueError(f"生成的分布查询 SQL 语义不符合口径：{semantic_error}")
+        raw = retry_raw
 
     res = {
         "sql": sql,
