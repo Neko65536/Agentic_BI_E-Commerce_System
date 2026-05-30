@@ -1,25 +1,15 @@
 """
-orchestrator_agent.py
+OrchestratorAgent.
 
-成员 B：Agent 编排与数据分析负责人
-
-作用：
-1. 用 LangGraph 设计整体 Agent 工作流。
-2. 协调 query_router 和 data_analysis_agent。
-3. 解析用户问题、拆分任务、调度数据分析 Agent、整合答案。
-4. 输出结构化结果，供可视化 Agent 和决策 Agent 使用。
-
-当前工作流：
-用户问题
+Current workflow:
+User question
   -> parse_question_node
-  -> route_query_node
+  -> coordinator_plan_node
   -> data_analysis_node
   -> package_downstream_node
   -> final_answer_node
 
-为什么用 LangGraph？
-LangGraph 可以把每一步封装成节点，每个节点读写同一个 state。
-你可以把它理解为“有状态的流程图”。
+This file coordinates agents. It does not generate SQL directly.
 """
 
 from __future__ import annotations
@@ -32,37 +22,24 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 
 
-# 允许直接运行：python agents/orchestrator_agent.py
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agents.data_analysis_agent import (
-    dataframe_to_rows,
-    execute_sql,
-    generate_sql,
-    recommend_chart,
-    summarize_result,
-)
-from agents.query_router import route_question
+from agents.coordinator_agent import create_task_plan
+from agents.data_analysis_agent import recommend_chart, run_data_analysis
+from agents.schemas import CoordinatorPlan, DataAnalysisResult
 
 
 class BIAnalysisState(TypedDict, total=False):
-    """
-    LangGraph 的共享状态。
-
-    每个节点接收 state，返回要更新的字段。
-    total=False 表示字段可以逐步补齐。
-    """
+    """LangGraph shared state."""
 
     question: str
+    history_context: list[dict[str, str]]
     normalized_question: str
-    route: dict[str, Any]
-    sql: str | None
-    params: dict[str, Any]
-    source_tables: list[str]
-    used_pre_aggregate: bool
-    strategy: str
+    coordinator_plan: CoordinatorPlan
+    data_analysis: DataAnalysisResult
+    sql: str
     rows: list[dict[str, Any]]
     row_count: int
     summary: str
@@ -72,165 +49,124 @@ class BIAnalysisState(TypedDict, total=False):
 
 
 def parse_question_node(state: BIAnalysisState) -> BIAnalysisState:
-    """
-    节点 1：解析用户问题。
-
-    目前先做最小处理：
-    - 去掉前后空白
-    - 保留原始中文问题
-    后续如果要支持复杂问题拆分，可以在这里扩展。
-    """
     question = state["question"].strip()
-
     return {
         "normalized_question": question,
+        "history_context": state.get("history_context", []),
         "errors": [],
     }
 
 
-def route_query_node(state: BIAnalysisState) -> BIAnalysisState:
+def coordinator_plan_node(state: BIAnalysisState) -> BIAnalysisState:
     """
-    节点 2：查询路由。
+    CoordinatorAgent call.
 
-    调用 query_router.py，判断：
-    - intent 是什么
-    - 是否使用预聚合表
-    - 目标表是哪张
-    - 回退表有哪些
+    It classifies the analysis type and creates one DataAnalysisAgent subtask.
     """
     question = state["normalized_question"]
-    route = route_question(question)
-
-    return {
-        "route": route,
-    }
+    plan = create_task_plan(
+        question=question,
+        history_context=state.get("history_context", []),
+    )
+    return {"coordinator_plan": plan}
 
 
 def data_analysis_node(state: BIAnalysisState) -> BIAnalysisState:
     """
-    节点 3：数据分析。
+    DataAnalysisAgent call.
 
-    根据 route 生成 SQL，执行 SQL，并生成摘要。
+    It generates SQL, executes the query, and returns the required output format.
     """
     question = state["normalized_question"]
-    route = state["route"]
-    plan = generate_sql(route)
+    coordinator_plan = state["coordinator_plan"]
+    task = coordinator_plan["task_plan"][0]
 
-    if plan.sql is None:
-        return {
-            "sql": None,
-            "params": plan.params,
-            "source_tables": plan.source_tables,
-            "used_pre_aggregate": plan.used_pre_aggregate,
-            "strategy": plan.strategy,
-            "rows": [],
-            "row_count": 0,
-            "summary": plan.note,
-        }
-
-    df = execute_sql(plan.sql, plan.params)
-    rows = dataframe_to_rows(df)
-    summary = summarize_result(question, route, plan, rows)
+    data_result = run_data_analysis(question=question, task=task)
 
     return {
-        "sql": plan.sql.strip(),
-        "params": plan.params,
-        "source_tables": plan.source_tables,
-        "used_pre_aggregate": plan.used_pre_aggregate,
-        "strategy": plan.strategy,
-        "rows": rows,
-        "row_count": len(rows),
-        "summary": summary,
+        "data_analysis": data_result,
+        "sql": data_result["sql"],
+        "rows": data_result["data"],
+        "row_count": len(data_result["data"]),
+        "summary": data_result["summary"],
     }
 
 
 def package_downstream_node(state: BIAnalysisState) -> BIAnalysisState:
     """
-    节点 4：打包给下游 Agent。
-
-    这一步非常重要，因为你的任务要求：
-    “将 SQL、查询结果和分析摘要以结构化形式传给可视化 Agent 和决策 Agent。”
-
-    所以这里明确输出两个包：
-    - visualization_agent_input
-    - decision_agent_input
+    Package structured output for future VisualizationAgent and DecisionAgent.
     """
-    route = state["route"]
-    intent = route["intent"]
+    plan = state["coordinator_plan"]
+    data_analysis = state["data_analysis"]
+    recommended_chart = recommend_chart(plan["analysis_type"], data_analysis)
 
     downstream_payload = {
         "visualization_agent_input": {
-            "analysis_type": intent,
-            "recommended_chart": recommend_chart(intent),
-            "data": state["rows"],
-            "row_count": state["row_count"],
-            "x_fields": route.get("dimensions", []),
-            "y_fields": route.get("metrics", []),
+            "question": state["question"],
+            "analysis_type": plan["analysis_type"],
+            "intent": plan["intent"],
+            "recommended_chart": recommended_chart,
+            "data": data_analysis["data"],
+            "row_count": len(data_analysis["data"]),
         },
         "decision_agent_input": {
             "question": state["question"],
-            "intent": intent,
-            "summary": state["summary"],
-            "key_findings": state["rows"][:5],
-            "sql": state["sql"],
-            "source_tables": state["source_tables"],
-            "used_pre_aggregate": state["used_pre_aggregate"],
-            "strategy": state["strategy"],
-            "route_reason": route.get("reason"),
+            "analysis_type": plan["analysis_type"],
+            "intent": plan["intent"],
+            "task_plan": plan["task_plan"],
+            "reasoning_summary": plan["reasoning_summary"],
+            "summary": data_analysis["summary"],
+            "key_findings": data_analysis["data"][:5],
+            "sql": data_analysis["sql"],
+            "used_view": data_analysis["used_view"],
+            "view_name": data_analysis["view_name"],
         },
     }
 
-    return {
-        "downstream_payload": downstream_payload,
-    }
+    return {"downstream_payload": downstream_payload}
 
 
 def final_answer_node(state: BIAnalysisState) -> BIAnalysisState:
-    """
-    节点 5：整合最终回答。
+    """Build user-facing answer."""
+    plan = state["coordinator_plan"]
+    data_analysis = state["data_analysis"]
 
-    面向用户的答案要简洁；
-    面向其他 Agent 的结构化数据放在 downstream_payload。
-    """
-    route = state["route"]
-
-    preagg_text = "是" if state["used_pre_aggregate"] else "否"
+    used_view_text = "是" if data_analysis["used_view"] else "否"
+    view_name_text = data_analysis["view_name"] or "无"
 
     final_answer = f"""
 分析完成。
 
 问题：{state["question"]}
 
-意图识别：{route["intent"]}
-查询策略：{state["strategy"]}
-是否使用预聚合表：{preagg_text}
-使用数据源：{", ".join(state["source_tables"])}
+分析类型：{plan["analysis_type"]}
+业务意图：{plan["intent"]}
+协调器说明：{plan["reasoning_summary"]}
 
-结论：
-{state["summary"]}
+是否使用预聚合视图：{used_view_text}
+命中视图：{view_name_text}
+返回行数：{len(data_analysis["data"])}
+
+统计摘要：
+{data_analysis["summary"]}
 """.strip()
 
-    return {
-        "final_answer": final_answer,
-    }
+    return {"final_answer": final_answer}
 
 
 def build_graph():
-    """
-    构建 LangGraph 工作流。
-    """
     workflow = StateGraph(BIAnalysisState)
 
     workflow.add_node("parse_question", parse_question_node)
-    workflow.add_node("route_query", route_query_node)
+    workflow.add_node("coordinator_plan", coordinator_plan_node)
     workflow.add_node("data_analysis", data_analysis_node)
     workflow.add_node("package_downstream", package_downstream_node)
     workflow.add_node("final_answer", final_answer_node)
 
     workflow.set_entry_point("parse_question")
 
-    workflow.add_edge("parse_question", "route_query")
-    workflow.add_edge("route_query", "data_analysis")
+    workflow.add_edge("parse_question", "coordinator_plan")
+    workflow.add_edge("coordinator_plan", "data_analysis")
     workflow.add_edge("data_analysis", "package_downstream")
     workflow.add_edge("package_downstream", "final_answer")
     workflow.add_edge("final_answer", END)
@@ -238,19 +174,15 @@ def build_graph():
     return workflow.compile()
 
 
-def run_orchestrator(question: str) -> dict[str, Any]:
-    """
-    对外主函数。
-
-    输入：
-        自然语言问题
-
-    输出：
-        包含 final_answer、sql、rows、downstream_payload 的完整结构化结果
-    """
+def run_orchestrator(
+    question: str,
+    history_context: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     graph = build_graph()
-    result = graph.invoke({"question": question})
-    return result
+    return graph.invoke({
+        "question": question,
+        "history_context": history_context or [],
+    })
 
 
 if __name__ == "__main__":
@@ -258,9 +190,7 @@ if __name__ == "__main__":
         "2017年GMV是多少？",
         "按月和各州排名的趋势怎样？",
         "平台整体准时交付率是多少？",
-        "哪些州延迟最严重？",
-        "哪种支付方式最受欢迎？",
-        "平均分期数是多少？",
+        "评价分数最低的卖家有哪些？",
     ]
 
     for question in test_questions:
@@ -271,6 +201,6 @@ if __name__ == "__main__":
         print("SQL:")
         print(result["sql"])
         print()
-        print("下游 Agent 输入示例:")
-        print(json.dumps(result["downstream_payload"], ensure_ascii=False, indent=2)[:1500])
+        print("DataAnalysisAgent 输出:")
+        print(json.dumps(result["data_analysis"], ensure_ascii=False, indent=2)[:1500])
         print()

@@ -1,24 +1,28 @@
 # prompts.yaml
 #
-# 成员 B：Agent 编排与数据分析负责人 Prompt 模板
+# Prompt templates and policy notes for the two-agent BI workflow.
 #
-# 作用：
-# 1. 统一 orchestrator、query_router、data_analysis_agent 的角色说明。
-# 2. 明确“优先使用预聚合视图，无法覆盖时回退原始表”的查询策略。
-# 3. 让未来接入 LLM 时，不需要把 Prompt 写死在 Python 代码里。
-#
-# 当前代码先用规则模板稳定覆盖课程典型问题；
-# 后续可在 general_analysis 场景下接入 LLM，并读取本文件中的模板。
+# Current architecture:
+# user question
+#   -> CoordinatorAgent creates a task plan
+#   -> DataAnalysisAgent generates safe SQL and executes it
+#   -> OrchestratorAgent integrates the result
 
 system:
-  role: "你是一个电商 BI 数据分析系统中的 Agent 编排与数据分析负责人。"
+  role: "你是一个电商 BI 数据分析系统。"
   language: "zh-CN"
   principles:
+    - "协调器 Agent 只负责意图识别、分析类型判断和任务计划，不直接生成 SQL。"
+    - "数据分析 Agent 负责生成 SQL、判断是否使用预聚合视图、执行查询并生成统计摘要。"
     - "优先使用预聚合视图 mv_*，只有在视图无法准确覆盖问题时才回退原始业务表。"
     - "所有 SQL 必须只读，只能使用 SELECT / WITH，不允许 INSERT、UPDATE、DELETE、DROP、ALTER、TRUNCATE。"
     - "回答必须基于数据库查询结果，不要编造数字。"
-    - "输出必须包含 SQL、查询结果、统计摘要，并能传给可视化 Agent 和决策 Agent。"
-    - "当预聚合表的口径不能精确回答问题时，必须说明回退原始表的原因。"
+
+analysis_types:
+  descriptive: "描述性分析：回答发生了什么，例如 GMV、排名、分布、趋势、最高/最低。"
+  diagnostic: "诊断性分析：回答为什么发生，例如延迟原因、低评分关联因素。"
+  predictive: "预测性分析：回答未来会怎样；当前阶段只查询历史数据作为预测输入。"
+  prescriptive: "规范性分析：回答应该怎么做；当前阶段只查询历史数据作为决策依据。"
 
 pre_aggregate_policy:
   priority: "pre_aggregate_first"
@@ -44,9 +48,6 @@ pre_aggregate_policy:
         - "total_orders"
         - "avg_basket"
         - "total_freight"
-      example_questions:
-        - "2017年GMV是多少？"
-        - "每个月GMV趋势如何？"
 
     mv_state_sales:
       grain: "YEAR-MONTH × customer_state"
@@ -62,9 +63,6 @@ pre_aggregate_policy:
         - "total_gmv"
         - "total_orders"
         - "unique_customers"
-      example_questions:
-        - "按月和各州排名的趋势怎样？"
-        - "哪些州GMV最高？"
 
     mv_category_sales:
       grain: "YEAR-MONTH × product_category_english"
@@ -79,9 +77,6 @@ pre_aggregate_policy:
         - "total_gmv"
         - "total_orders"
         - "avg_price"
-      example_questions:
-        - "哪些品类销售额最高？"
-        - "各品类GMV趋势如何？"
 
     mv_delivery_perf:
       grain: "YEAR-MONTH × customer_state"
@@ -100,9 +95,6 @@ pre_aggregate_policy:
       caveats:
         - "该表没有 total_orders 字段。"
         - "如果问题要求平台整体订单级准时率，应回退 orders 原始表计算。"
-      example_questions:
-        - "哪些州延迟最严重？"
-        - "各州准时率如何？"
 
     mv_seller_perf:
       grain: "YEAR-MONTH × seller_id"
@@ -119,9 +111,6 @@ pre_aggregate_policy:
         - "total_gmv"
         - "total_orders"
         - "avg_review_score"
-      example_questions:
-        - "评价分数最低的卖家有哪些？"
-        - "哪些卖家GMV最高？"
 
     mv_payment_dist:
       grain: "YEAR-MONTH × payment_type"
@@ -137,66 +126,36 @@ pre_aggregate_policy:
         - "total_transactions"
         - "avg_installments"
         - "total_value"
-      example_questions:
-        - "哪种支付方式最受欢迎？"
-        - "平均分期数是多少？"
 
-orchestrator_agent:
+coordinator_agent:
   role: "协调器 Agent"
   responsibilities:
-    - "接收用户自然语言问题。"
-    - "标准化问题文本。"
-    - "调用 query_router 判断分析意图和查询路径。"
-    - "调用 data_analysis_agent 生成 SQL、执行查询并生成摘要。"
-    - "整合最终回答。"
-    - "把结构化结果传给 visualization_agent 和 decision_agent。"
+    - "接收用户自然语言问题和历史会话上下文。"
+    - "判断分析类型：descriptive、diagnostic、predictive、prescriptive。"
+    - "生成任务计划 task_plan。"
+    - "当前阶段只调度 data_analysis_agent。"
   output_format:
     question: "用户原始问题"
-    intent: "识别出的分析意图"
-    strategy: "pre_aggregate 或 fallback_raw_table 或 needs_llm_or_manual_sql"
-    source_tables: "实际使用的数据表"
-    sql: "执行的 SQL"
-    rows: "查询结果列表"
-    summary: "面向用户的统计摘要"
-    downstream_payload:
-      visualization_agent_input: "可视化 Agent 输入"
-      decision_agent_input: "决策 Agent 输入"
-
-query_router:
-  role: "查询路由 Agent"
-  instruction: >
-    根据用户问题判断 intent、目标表、指标、维度和过滤条件。
-    必须优先判断是否能使用 mv_* 预聚合表。
-    当无法覆盖时，返回 use_pre_aggregate=false，并给出 fallback_tables。
-  intents:
-    gmv:
-      keywords: ["GMV", "销售额", "成交额", "交易额"]
-      preferred_table: "mv_monthly_sales"
-    state_sales_trend:
-      keywords: ["按月", "月度", "趋势", "州", "地区", "排名"]
-      preferred_table: "mv_state_sales"
-    on_time_delivery_rate:
-      keywords: ["准时", "按时", "准时交付", "准时送达"]
-      preferred_table: "orders"
-      reason: "平台整体订单级准时率需要订单级分母，mv_delivery_perf 缺少 total_orders。"
-    delivery_delay:
-      keywords: ["延迟", "延期", "最慢", "最严重"]
-      preferred_table: "mv_delivery_perf"
-    payment_method_popularity:
-      keywords: ["支付方式", "付款方式", "最受欢迎"]
-      preferred_table: "mv_payment_dist"
-    avg_installments:
-      keywords: ["分期", "平均分期", "installment"]
-      preferred_table: "mv_payment_dist"
-    general_analysis:
-      preferred_table: null
-      reason: "未命中规则，需要回退原始表或交给 LLM 生成 SQL。"
+    analysis_type: "descriptive / diagnostic / predictive / prescriptive"
+    intent: "snake_case 业务意图"
+    task_plan: "子任务列表，当前阶段只有 data_analysis_agent 任务"
+    reasoning_summary: "分类与任务拆解说明"
 
 data_analysis_agent:
   role: "数据分析 Agent"
-  instruction: >
-    根据 query_router 的路由结果生成 SQL、执行 SQL、返回 rows 和 summary。
-    生成 SQL 时必须遵循只读原则，并优先使用 route.target_table。
+  responsibilities:
+    - "接收用户问题、数据字典、预聚合视图说明和协调器任务。"
+    - "生成只读 SQL。"
+    - "判断是否使用预聚合视图。"
+    - "执行 SQL 并返回 JSON 友好的结果。"
+    - "生成统计摘要。"
+  output_format:
+    question: "用户问题"
+    sql: "执行的 SQL 语句"
+    used_view: "是否使用预聚合视图，boolean"
+    view_name: "命中的预聚合视图名称；未命中时为 null"
+    data: "查询结果 JSON records"
+    summary: "统计摘要"
   sql_rules:
     - "只生成 MySQL SELECT 或 WITH 查询。"
     - "不要生成 DDL 或 DML。"
@@ -206,69 +165,18 @@ data_analysis_agent:
     - "平均分期数必须使用加权平均：SUM(avg_installments * total_transactions) / SUM(total_transactions)。"
     - "支付方式最受欢迎默认按 total_transactions 排序。"
     - "延迟最严重州默认按 delayed_orders 降序排序。"
+    - "注意 mv_* 视图的声明粒度（grain）是否与用户问题所需粒度一致。若视图粒度比问题粒度更细（典型情形：视图包含 YEAR-MONTH 时间维度，而问题问的是跨时间周期的整体分布/排名/占比），不能直接在视图的明细行上计算汇总指标或窗口占比，必须先 GROUP BY 目标维度聚合消除多余粒度。"
 
-summary_generation:
-  role: "统计摘要生成规则"
-  instruction: >
-    根据查询结果生成简洁中文摘要。
-    摘要必须包含关键数值、排名或比例。
-    如果使用 fallback_raw_table，必须解释为什么没有使用预聚合表。
-  templates:
-    gmv: "查询结果显示，GMV 为 {gmv}，订单数为 {total_orders}，平均客单价约为 {avg_basket}。"
-    on_time_delivery_rate: "平台整体准时交付率约为 {on_time_rate_percent}%。有效配送订单数为 {valid_delivery_orders}。"
-    delivery_delay: "延迟最严重的州是 {customer_state}，延迟订单数为 {delayed_orders}。"
-    payment_method_popularity: "最受欢迎的支付方式是 {payment_type}，交易次数为 {total_transactions}。"
-    avg_installments: "平台整体平均分期数约为 {overall_avg_installments}。"
-
-downstream_contract:
-  visualization_agent_input:
-    required_fields:
-      - "analysis_type"
-      - "recommended_chart"
-      - "data"
-      - "row_count"
-      - "x_fields"
-      - "y_fields"
-
-  decision_agent_input:
-    required_fields:
-      - "question"
-      - "intent"
-      - "summary"
-      - "key_findings"
-      - "sql"
-      - "source_tables"
-      - "used_pre_aggregate"
-      - "strategy"
-      - "route_reason"
-
-example_questions:
-  - question: "2017年GMV是多少？"
-    expected_intent: "gmv"
-    expected_strategy: "pre_aggregate"
-    expected_table: "mv_monthly_sales"
-
-  - question: "按月和各州排名的趋势怎样？"
-    expected_intent: "state_sales_trend"
-    expected_strategy: "pre_aggregate"
-    expected_table: "mv_state_sales"
-
-  - question: "平台整体准时交付率是多少？"
-    expected_intent: "on_time_delivery_rate"
-    expected_strategy: "fallback_raw_table"
-    expected_table: "orders"
-
-  - question: "哪些州延迟最严重？"
-    expected_intent: "delivery_delay"
-    expected_strategy: "pre_aggregate"
-    expected_table: "mv_delivery_perf"
-
-  - question: "哪种支付方式最受欢迎？"
-    expected_intent: "payment_method_popularity"
-    expected_strategy: "pre_aggregate"
-    expected_table: "mv_payment_dist"
-
-  - question: "平均分期数是多少？"
-    expected_intent: "avg_installments"
-    expected_strategy: "pre_aggregate"
-    expected_table: "mv_payment_dist"
+  distribution_grain_mismatch:
+    description: >
+      常见错误模式：mv_* 视图的粒度是「YEAR-MONTH × 业务维度」，但用户问题只关心
+      「业务维度的整体分布」，不区分月份。LLM 倾向于直接对原粒度行使用窗口函数算占比，
+      导致同一业务维度值被拆到多行，占比计算错误。
+    correct_pattern: >
+      先 GROUP BY 业务维度，用 SUM() 聚合度量值（如 total_transactions、total_gmv），
+      消除时间粒度后再计算占比或排名。若问题指定了年份，先 WHERE 过滤再聚合。若问题
+      未指定时间范围，默认全期汇总。
+    affected_views:
+      - "mv_payment_dist (YEAR-MONTH × payment_type) → 支付方式整体分布"
+      - "mv_category_sales (YEAR-MONTH × product_category_english) → 品类整体结构"
+      - "mv_state_sales (YEAR-MONTH × customer_state) → 各州整体排名"
