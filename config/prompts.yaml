@@ -21,7 +21,7 @@ system:
 analysis_types:
   descriptive: "描述性分析：回答发生了什么，例如 GMV、排名、分布、趋势、最高/最低。"
   diagnostic: "诊断性分析：回答为什么发生，例如延迟原因、低评分关联因素。"
-  predictive: "预测性分析：回答未来会怎样；当前阶段只查询历史数据作为预测输入。"
+  predictive: "预测性分析：回答未来会怎样；应优先查询 mv_monthly_sales 全量历史月度 GMV 作为预测输入。"
   prescriptive: "规范性分析：回答应该怎么做；当前阶段只查询历史数据作为决策依据。"
 
 pre_aggregate_policy:
@@ -165,6 +165,7 @@ data_analysis_agent:
     - "平均分期数必须使用加权平均：SUM(avg_installments * total_transactions) / SUM(total_transactions)。"
     - "支付方式最受欢迎默认按 total_transactions 排序。"
     - "延迟最严重州默认按 delayed_orders 降序排序。"
+    - "预测未来销售额/GMV时，必须优先查询 mv_monthly_sales 的全量历史月份，不要使用 CURDATE() 或最近52周过滤，因为Olist数据集是2016-2018年的历史数据。"
     - "注意 mv_* 视图的声明粒度（grain）是否与用户问题所需粒度一致。若视图粒度比问题粒度更细（典型情形：视图包含 YEAR-MONTH 时间维度，而问题问的是跨时间周期的整体分布/排名/占比），不能直接在视图的明细行上计算汇总指标或窗口占比，必须先 GROUP BY 目标维度聚合消除多余粒度。"
 
   distribution_grain_mismatch:

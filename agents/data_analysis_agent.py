@@ -116,6 +116,105 @@ def detect_view_name(sql: str) -> str | None:
     return match.group(1) if match else None
 
 
+def detect_view_names(sql: str) -> list[str]:
+    """Detect all mv_* tables referenced in generated SQL."""
+    matches = re.findall(r"\b(?:FROM|JOIN)\s+`?(mv_[a-zA-Z0-9_]+)`?\b", sql, flags=re.IGNORECASE)
+    result: list[str] = []
+    for name in matches:
+        if name not in result:
+            result.append(name)
+    return result
+
+
+def _normalize_question(question: str) -> str:
+    return re.sub(r"\s+", "", question.lower())
+
+
+def required_views_for_question(question: str) -> list[str]:
+    """
+    Return view coverage requirements for explicit multi-metric questions.
+
+    This does not provide SQL. It only checks whether the LLM-generated SQL
+    covers the source views required by the user's question.
+    """
+    q = _normalize_question(question)
+    required: list[str] = []
+
+    if (
+        "2017" in q
+        and "gmv" in q
+        and ("按月" in q or "月" in q)
+        and ("州" in q or "排名" in q)
+    ):
+        required.extend(["mv_monthly_sales", "mv_state_sales"])
+
+    if ("准时" in q or "准时交付" in q) and ("延迟" in q or "州" in q):
+        required.append("mv_delivery_perf")
+
+    if ("配送时长" in q or "配送" in q) and ("州" in q or "全国均值" in q):
+        required.append("mv_delivery_perf")
+
+    if "支付方式" in q and ("最受欢迎" in q or "分期" in q):
+        required.append("mv_payment_dist")
+
+    if ("预测" in q or "未来" in q) and ("销售" in q or "gmv" in q):
+        required.append("mv_monthly_sales")
+
+    return list(dict.fromkeys(required))
+
+
+def required_sql_signals_for_question(question: str) -> list[tuple[str, str]]:
+    """Return non-view SQL coverage signals that the LLM must include."""
+    q = _normalize_question(question)
+    signals: list[tuple[str, str]] = []
+    if "支付方式" in q and ("最受欢迎" in q or "分期" in q):
+        signals.extend([
+            ("GROUP BY payment_type", "支付方式整体偏好必须先GROUP BY payment_type汇总。"),
+            ("SUM(total_transactions)", "支付方式整体偏好必须用SUM(total_transactions)汇总交易数。"),
+        ])
+        if "分期" in q:
+            signals.append(
+                ("avg_installments * total_transactions", "平均分期数必须按total_transactions加权计算。")
+            )
+
+    if "卖家" in q and "差评率" in q:
+        signals.extend([
+            ("order_reviews", "计算卖家差评率必须查询评论表。"),
+            ("order_items", "计算卖家差评率必须通过订单明细关联seller_id。"),
+            ("seller_id", "结果必须包含卖家ID维度。"),
+            ("negative_rate", "结果必须显式计算差评率negative_rate。"),
+        ])
+    return signals
+
+
+def missing_required_sql_signals(sql: str, signals: list[tuple[str, str]]) -> list[str]:
+    sql_lower = sql.lower()
+    sql_compact = re.sub(r"\s+", "", sql_lower)
+    missing: list[str] = []
+    for token, description in signals:
+        token_lower = token.lower()
+        token_compact = re.sub(r"\s+", "", token_lower)
+        if token_compact == "avg_installments*total_transactions":
+            reverse_token = "total_transactions*avg_installments"
+            if token_compact in sql_compact or reverse_token in sql_compact:
+                continue
+        if token_lower not in sql_lower and token_compact not in sql_compact:
+            missing.append(description)
+    return missing
+
+
+def validate_mysql_surface_sql(sql: str) -> str | None:
+    """Catch MySQL syntax risks that are common in LLM-generated SQL."""
+    if re.search(r"\bAS\s+`?rank`?\b", sql, flags=re.IGNORECASE):
+        return "rank是MySQL窗口函数相关保留词，不要作为列别名；请改用state_rank、rank_value或ranking。"
+
+    lowered = sql.lower()
+    if "union all" in lowered and re.search(r"\border\s+by\b[\s\S]*\brnk\b", lowered):
+        return "UNION查询的ORDER BY不能引用CTE内部别名rnk；请使用最终输出列别名，或用外层SELECT包装后排序。"
+
+    return None
+
+
 # 有已知粒度不一致风险的视图：粒度为 YEAR-MONTH × 维度，
 # 但用户的问题通常只问维度的分布（忽略时间）。
 GRAIN_MISMATCH_VIEWS: dict[str, dict[str, str]] = {
@@ -159,8 +258,9 @@ def validate_distribution_grain(sql: str) -> str | None:
 
     dim = matched_info["dimension"]
 
-    # 检测是否在未 GROUP BY 维度的情况下用窗口函数计算占比
-    has_over = bool(re.search(r"over\s*\(", normalized))
+    # 只检测“用 SUM(...) OVER() 计算整体占比”的风险。
+    # ROW_NUMBER() / RANK() 等窗口排名可用于年月内州排名，不应拦截。
+    has_over = bool(re.search(r"sum\s*\([^)]*\)\s*over\s*\(", normalized))
     has_group_by_dim = bool(re.search(rf"group\s+by\s+.*\b{dim}\b", normalized))
 
     if has_over and not has_group_by_dim:
@@ -193,6 +293,16 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
 7. 不要编造不存在的表或字段。
 8. 涉及 `year_month` 字段时必须使用反引号。
 9. 默认加 LIMIT，除非查询是单行聚合指标。
+10. 预测未来销售额/GMV时，必须优先查询 mv_monthly_sales 全量历史月份，不要使用 CURDATE() 或最近52周过滤，因为Olist是2016-2018年的历史数据集。
+11. 如果问题同时包含多个指标或多个维度，允许使用 WITH 将多个预聚合视图组合到一条SQL中，优先保证所有被问到的指标都能被覆盖。
+12. 当问题同时询问“2017年GMV”“按月趋势”“各州排名”时，SQL必须同时命中 mv_monthly_sales 和 mv_state_sales：用 mv_monthly_sales 计算年度GMV和月度GMV，用 mv_state_sales 计算州排名。
+13. 当问题询问平台准时交付率和延迟严重州时，优先命中 mv_delivery_perf；如果需要订单级整体准时率，可回退orders原始表计算整体口径，并保留 mv_delivery_perf 输出州级延迟。
+14. 当问题询问最受欢迎支付方式和平均分期数时，优先命中 mv_payment_dist，并使用 total_transactions 加权计算 avg_installments。
+15. 当问题询问产品重量、尺寸与运费关系时，mv_*无法覆盖，查询 products、order_items 以及必要的品类翻译表。
+16. 当问题询问差评品类和差评原因时，查询 order_reviews、order_items、products、product_category_name_translation，返回低评分评论文本和品类聚合，供NLPAgent提取主题。
+17. 当问题询问“卖家差评率最高”时，必须查询 order_reviews、order_items、sellers，按 seller_id 计算 review_count、negative_reviews、negative_rate，并按 negative_rate 降序返回高差评率卖家。
+18. 当问题同时询问州配送时长高于全国均值和高差评率卖家时，允许用 UNION ALL 或 JSON 字段在同一条SQL中同时返回州级配送异常和卖家差评率结果。
+19. 当问题询问综合改进策略或多维诊断时，优先组合销售、配送、支付、评论/品类或卖家相关数据，返回足够的决策依据。
 
 数据字典：
 {data_dictionary}
@@ -239,6 +349,9 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
         view_name = None
     if not view_name:
         view_name = detect_view_name(sql)
+    view_names = detect_view_names(sql)
+    if view_names:
+        view_name = ",".join(view_names)
 
     used_view = bool(raw.get("used_view")) or bool(view_name)
 
@@ -265,10 +378,103 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             view_name = None
         if not view_name:
             view_name = detect_view_name(sql)
+        view_names = detect_view_names(sql)
+        if view_names:
+            view_name = ",".join(view_names)
         used_view = bool(retry_raw.get("used_view")) or bool(view_name)
         semantic_error = validate_distribution_grain(sql)
         if semantic_error:
             raise ValueError(f"生成的分布查询 SQL 语义不符合口径：{semantic_error}")
+        raw = retry_raw
+
+    required_views = required_views_for_question(question)
+    missing_views = [name for name in required_views if name not in detect_view_names(sql)]
+    if missing_views:
+        retry_raw = _call_llm(
+            "当前SQL没有覆盖用户问题明确需要的数据来源。"
+            f"必须同时命中这些预聚合视图：{', '.join(required_views)}。"
+            "请重新生成一条可执行的MySQL SELECT或WITH查询，允许用CTE组合多个视图，"
+            "并确保结果能回答用户问题中的所有指标和维度。"
+        )
+        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        view_name = retry_raw.get("view_name")
+        if view_name in ("", "null", "None"):
+            view_name = None
+        if not view_name:
+            view_name = detect_view_name(sql)
+        view_names = detect_view_names(sql)
+        if view_names:
+            view_name = ",".join(view_names)
+        used_view = bool(retry_raw.get("used_view")) or bool(view_name)
+        semantic_error = validate_distribution_grain(sql)
+        if semantic_error:
+            raise ValueError(f"生成的分布查询 SQL 语义不符合口径：{semantic_error}")
+        missing_views = [name for name in required_views if name not in detect_view_names(sql)]
+        if missing_views:
+            raise ValueError(f"生成的SQL未覆盖必需预聚合视图：{', '.join(missing_views)}")
+        raw = retry_raw
+
+    required_signals = required_sql_signals_for_question(question)
+    missing_signals = missing_required_sql_signals(sql, required_signals)
+    if missing_signals:
+        retry_raw = _call_llm(
+            "当前SQL没有覆盖用户问题明确需要的诊断指标："
+            f"{'；'.join(missing_signals)}"
+            "请重新生成一条可执行的MySQL SELECT或WITH查询。"
+            f"如果当前问题需要预聚合视图，也必须保留这些视图：{', '.join(required_views) or '无'}。"
+            "如果问题还有配送时长诊断，也要保留 mv_delivery_perf 对州级配送表现的分析；"
+            "如果问题询问卖家差评率，必须返回negative_rate。"
+        )
+        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        view_name = retry_raw.get("view_name")
+        if view_name in ("", "null", "None"):
+            view_name = None
+        if not view_name:
+            view_name = detect_view_name(sql)
+        view_names = detect_view_names(sql)
+        if view_names:
+            view_name = ",".join(view_names)
+        used_view = bool(retry_raw.get("used_view")) or bool(view_name)
+        semantic_error = validate_distribution_grain(sql)
+        if semantic_error:
+            raise ValueError(f"生成的分布查询 SQL 语义不符合口径：{semantic_error}")
+        missing_signals = missing_required_sql_signals(sql, required_signals)
+        if missing_signals:
+            raise ValueError(f"生成的SQL未覆盖必需诊断指标：{'；'.join(missing_signals)}")
+        missing_views = [name for name in required_views if name not in detect_view_names(sql)]
+        if missing_views:
+            raise ValueError(f"生成的SQL未覆盖必需预聚合视图：{', '.join(missing_views)}")
+        raw = retry_raw
+
+    surface_error = validate_mysql_surface_sql(sql)
+    if surface_error:
+        retry_raw = _call_llm(
+            "当前SQL存在MySQL语法风险："
+            f"{surface_error}"
+            "请重新生成一条可执行的MySQL SELECT或WITH查询，仍需完整回答用户问题。"
+        )
+        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        view_name = retry_raw.get("view_name")
+        if view_name in ("", "null", "None"):
+            view_name = None
+        if not view_name:
+            view_name = detect_view_name(sql)
+        view_names = detect_view_names(sql)
+        if view_names:
+            view_name = ",".join(view_names)
+        used_view = bool(retry_raw.get("used_view")) or bool(view_name)
+        semantic_error = validate_distribution_grain(sql)
+        if semantic_error:
+            raise ValueError(f"生成的分布查询 SQL 语义不符合口径：{semantic_error}")
+        missing_views = [name for name in required_views if name not in detect_view_names(sql)]
+        if missing_views:
+            raise ValueError(f"生成的SQL未覆盖必需预聚合视图：{', '.join(missing_views)}")
+        missing_signals = missing_required_sql_signals(sql, required_signals)
+        if missing_signals:
+            raise ValueError(f"生成的SQL未覆盖必需诊断指标：{'；'.join(missing_signals)}")
+        surface_error = validate_mysql_surface_sql(sql)
+        if surface_error:
+            raise ValueError(f"生成的SQL仍存在MySQL语法风险：{surface_error}")
         raw = retry_raw
 
     res = {
@@ -303,12 +509,111 @@ def summarize_rows(
     )
 
 
+def repair_sql_plan_after_error(
+    question: str,
+    task: AgentTask,
+    failed_plan: dict[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    """
+    Ask the LLM to repair its own SQL after a database execution error.
+
+    This is not a rule fallback: the corrected SQL is still generated by the
+    LLM from the schema, task, failed SQL, and concrete MySQL error.
+    """
+    data_dictionary = load_data_dictionary_context()
+    pre_aggregate_policy = load_pre_aggregate_policy_context()
+
+    system_prompt = f"""
+你是电商 BI 系统中的数据分析 Agent，正在修复你上一次生成但执行失败的 MySQL SQL。
+
+修复要求：
+1. 仍然只能返回 SELECT 或 WITH 查询。
+2. 禁止 INSERT、UPDATE、DELETE、DROP、ALTER、TRUNCATE、CREATE。
+3. 必须根据数据库错误修正 SQL，不要返回解释正文。
+4. 不要编造不存在的表或字段。
+5. 所有出现 year_month 字段的地方都必须写成 `year_month`，包括 SELECT、WHERE、GROUP BY、ORDER BY、JOIN、CTE 中的引用。
+6. 如果问题能由 mv_* 预聚合表覆盖，仍应优先使用 mv_*。
+7. 不要使用 rank 作为列别名；需要排名字段时使用 state_rank、rank_value 或 ranking。
+8. UNION / UNION ALL 查询的 ORDER BY 只能引用最终输出列或外层查询别名，不要引用CTE内部别名。
+
+数据字典：
+{data_dictionary}
+
+预聚合视图策略：
+{pre_aggregate_policy}
+
+你必须返回 JSON，不要 Markdown，不要解释性正文。
+返回格式必须为：
+{{
+  "sql": "SELECT ...",
+  "used_view": true,
+  "view_name": "mv_xxx 或 null",
+  "summary_intent": "说明修复后的 SQL 如何回答问题"
+}}
+""".strip()
+
+    user_prompt = f"""
+用户问题：
+{question}
+
+协调器分配的子任务：
+{json.dumps(task, ensure_ascii=False, indent=2)}
+
+上一次失败的 SQL：
+{failed_plan.get("sql")}
+
+MySQL/SQLAlchemy 报错：
+{error}
+
+请修复 SQL，并保持查询口径能回答用户问题。
+""".strip()
+
+    raw = LLMClient().chat_json([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ])
+
+    sql = validate_readonly_sql(str(raw.get("sql", "")))
+    view_name = raw.get("view_name")
+    if view_name in ("", "null", "None"):
+        view_name = None
+    view_names = detect_view_names(sql)
+    if view_names:
+        view_name = ",".join(view_names)
+    elif not view_name:
+        view_name = detect_view_name(sql)
+
+    semantic_error = validate_distribution_grain(sql)
+    if semantic_error:
+        raise ValueError(f"修复后的 SQL 语义不符合口径：{semantic_error}")
+
+    surface_error = validate_mysql_surface_sql(sql)
+    if surface_error:
+        raise ValueError(f"修复后的 SQL 仍存在MySQL语法风险：{surface_error}")
+
+    repaired = {
+        "sql": sql,
+        "used_view": bool(raw.get("used_view")) or bool(view_name),
+        "view_name": str(view_name) if view_name else None,
+        "summary_intent": str(raw.get("summary_intent") or "LLM已根据数据库错误修复SQL。"),
+    }
+    print("=========数据分析Agent-LLM修复SQL返回：============")
+    print(repaired)
+    print("==========================================")
+    return repaired
+
+
 def run_data_analysis(question: str, task: AgentTask) -> DataAnalysisResult:
     """
     Public entry point for DataAnalysisAgent.
     """
     sql_plan = generate_sql_plan(question, task)
-    df = execute_sql(sql_plan["sql"])
+    try:
+        df = execute_sql(sql_plan["sql"])
+    except Exception as exc:
+        sql_plan = repair_sql_plan_after_error(question, task, sql_plan, exc)
+        df = execute_sql(sql_plan["sql"])
     rows = dataframe_to_rows(df)
     summary = summarize_rows(question, sql_plan, rows)
 
