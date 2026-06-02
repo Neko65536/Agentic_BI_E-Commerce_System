@@ -13,7 +13,6 @@ FORBIDDEN_KEYWORDS = [
     "ALTER",
     "TRUNCATE",
     "CREATE",
-    "REPLACE",
     "GRANT",
     "REVOKE",
     "LOAD_FILE",

@@ -11,10 +11,12 @@ from pydantic import BaseModel
 
 class AskRequest(BaseModel):
     question: str
+    session_id: str | None = None
     history_context: list[dict[str, str]] | None = None
 
 
 class AskResponseData(BaseModel):
+    session_id: str
     question: str
     analysis_type: str
     intent: str
@@ -23,6 +25,12 @@ class AskResponseData(BaseModel):
     summary: str
     final_answer: str
     downstream_payload: dict[str, Any] | None = None
+    visualization_result: dict[str, Any] | None = None
+    forecast_result: dict[str, Any] | None = None
+    nlp_result: dict[str, Any] | None = None
+    what_if_result: dict[str, Any] | None = None
+    decision_result: dict[str, Any] | None = None
+    recommendations: list[dict[str, Any]] | None = None
     errors: list[str]
 
 

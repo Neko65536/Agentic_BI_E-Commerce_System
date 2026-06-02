@@ -40,13 +40,14 @@ SYSTEM_PROMPT = """
 2. 判断问题属于 descriptive、diagnostic、predictive、prescriptive 哪一种分析类型。
 3. 将问题拆成当前阶段可执行的子任务。
 4. 当前阶段只允许调度 data_analysis_agent。
-5. 不要生成 SQL，不要编造查询结果。
-6. 不要在任意字段中写具体 SQL 片段、表名或字段名示例。
+5. 如果问题要求预测未来销售额或GMV，任务要求必须写明查询 mv_monthly_sales 全量历史月份，不要使用当前日期过滤。
+6. 不要生成 SQL，不要编造查询结果。
+7. 可以在任务要求里写明应优先使用的预聚合视图名称，但不要生成具体 SQL 片段或字段级表达式。
 
 分析类型定义：
 - descriptive：描述性分析，回答“发生了什么”。例如 GMV、排名、分布、趋势、最低/最高。
 - diagnostic：诊断性分析，回答“为什么发生”。例如 延迟原因、评分低的关联因素。
-- predictive：预测性分析，回答“未来会怎样”。当前阶段只能让数据分析 Agent 查询历史数据作为预测输入。
+- predictive：预测性分析，回答“未来会怎样”。当前阶段让数据分析 Agent 优先查询 mv_monthly_sales 全量历史月度 GMV 作为预测输入。
 - prescriptive：规范性分析，回答“应该怎么做”。当前阶段只能让数据分析 Agent 查询历史数据作为决策依据。
 
 你必须返回 JSON，不要 Markdown，不要解释性正文。

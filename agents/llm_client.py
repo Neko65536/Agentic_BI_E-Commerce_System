@@ -54,7 +54,28 @@ class LLMClient:
         智谱文档说明结构化输出可以使用：
         response_format={"type": "json_object"}
         """
+        content = self._chat_json_text(messages)
 
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            retry_messages = messages + [
+                {"role": "assistant", "content": content},
+                {
+                    "role": "user",
+                    "content": (
+                        "上一条回复不是合法JSON。请只返回一个可被json.loads解析的JSON对象，"
+                        "不要Markdown，不要注释，不要省略号，不要示例占位符。"
+                    ),
+                },
+            ]
+            retry_content = self._chat_json_text(retry_messages)
+            try:
+                return json.loads(retry_content)
+            except json.JSONDecodeError as retry_exc:
+                raise LLMClientError(f"LLM 返回的不是合法 JSON：{retry_content}") from retry_exc
+
+    def _chat_json_text(self, messages: list[dict[str, str]]) -> str:
         try:
             response = self.client.chat.completions.create(
                 model=LLM_SETTINGS.model,
@@ -65,9 +86,4 @@ class LLMClient:
         except openai.APIError as exc:
             raise LLMClientError(f"LLM JSON 调用失败：{exc}") from exc
 
-        content = response.choices[0].message.content or ""
-
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise LLMClientError(f"LLM 返回的不是合法 JSON：{content}") from exc
+        return response.choices[0].message.content or ""
