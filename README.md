@@ -19,6 +19,12 @@
 在项目根目录执行：
 
 ```bash
+# Windows 系统
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Linux/Mac 系统
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -27,6 +33,10 @@ pip install -r requirements.txt
 ## 4. 配置环境变量
 
 ```bash
+# Windows 系统
+copy .env.example .env
+
+# Linux/Mac 系统
 cp .env.example .env
 ```
 - 在 `.env` 中配置必要环境变量
@@ -55,7 +65,7 @@ LLM_TIMEOUT_SECONDS=60
 - 测试 `LLM` 可用性：
 
 ```bash
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 python -m utils.test_llm
 ```
 
@@ -64,7 +74,7 @@ python -m utils.test_llm
 仍在项目根：
 
 ```bash
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 python utils/data_cleaning.py
 python utils/db_init.py
 ```
@@ -93,7 +103,7 @@ python utils/db_init.py
 ### 启动服务
 
 ```bash
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt   # 首次或新增依赖后执行
 python server.py
 ```
@@ -162,10 +172,23 @@ AgenticBI_Final_Olist/
 │   ├── __init__.py
 │   ├── orchestrator_agent.py   # 工作流编排（LangGraph）
 │   ├── coordinator_agent.py    # 协调器：分类意图、生成计划
-│   └── data_analysis_agent.py  # 数据分析：生成 SQL + 执行查询
+│   ├── data_analysis_agent.py  # 数据分析：生成 SQL + 执行查询
+│   ├── visualization_agent.py  # 可视化 Agent：图表类型选择与生成
+│   ├── nlp_review_agent.py     # NLP Agent：评论分析
+│   ├── decision_agent.py       # 决策 Agent：运营建议
+│   └── what_if_agent.py        # 假设分析 Agent
+├── dashboard/                  # Streamlit 前端界面（成员 D）
+│   ├── app_ui.py               # 主界面：对话输入 + 可视化展示
+│   └── chart_renderer.py       # 图表渲染器：支持六类图表
 ├── config/
 │   ├── settings.py             # 全局配置（端口、LLM、数据库）
-│   └── data_dictionary.yaml    # 数据字典 / 口径定义
+│   ├── data_dictionary.yaml    # 数据字典 / 口径定义
+│   └── prompts.yaml            # 提示词模板
+├── models/                     # 预测模型
+│   ├── forecast_model.py       # 销售预测模型
+│   ├── anomaly_model.py        # 异常检测模型
+│   ├── sentiment_model.py      # 情感分析模型
+│   └── what_if_model.py        # 假设分析模型
 ├── utils/
 │   ├── data_cleaning.py
 │   ├── db_init.py
@@ -174,8 +197,128 @@ AgenticBI_Final_Olist/
 │   └── perf_comparison_queries.sql
 ├── data/raw/
 ├── data/clean/
-├── outputs/
+├── outputs/                    # 输出目录（成员 D）
+│   ├── charts/                 # 生成的图表文件
+│   ├── screenshots/            # 运行截图
+│   └── demo/                   # 演示材料
+├── app.py                      # 系统入口（成员 D）
 ├── server.py                   # FastAPI 应用入口
 ├── requirements.txt
 └── README.md
+```
+
+---
+
+## 10. 可视化与前端界面（成员 D）
+
+### 10.1 启动方式
+
+#### 方式一：完整启动（前后端同时启动）
+
+```bash
+.\.venv\Scripts\Activate.ps1
+python app.py --mode full
+```
+
+#### 方式二：仅启动后端
+
+```bash
+.\.venv\Scripts\Activate.ps1
+python app.py --mode backend
+```
+
+#### 方式三：仅启动前端
+
+```bash
+.\.venv\Scripts\Activate.ps1
+python app.py --mode frontend
+```
+
+### 10.2 访问地址
+
+| 服务 | 地址 |
+|------|------|
+| 前端界面 | http://localhost:8501 |
+| 后端 API | http://localhost:8000 |
+| API 文档 | http://localhost:8000/docs |
+
+### 10.3 前端界面功能
+
+- **左侧对话输入区**：用户输入问题，支持多轮问答
+- **右侧可视化展示区**：展示分析结果和图表
+- **图表类型支持**：
+  - 时间序列折线图
+  - 地理气泡图（巴西各州）
+  - 柱状图/条形图
+  - 矩阵热力图
+  - 散点图/气泡图
+  - 词云图
+- **多轮问答**：支持上下文关联，后续问题可引用前一次分析结果
+
+### 10.4 演示流程
+
+1. **启动系统**：
+   ```bash
+   python app.py --mode full
+   ```
+
+2. **打开前端界面**：访问 http://localhost:8501
+
+3. **示例问题**：
+   - "2017年GMV按月趋势如何？"
+   - "哪个州的销售额最高？"
+   - "最受欢迎的支付方式是什么？"
+   - "评价分数最低的卖家有哪些？"
+   - "未来六周的销售预测是多少？"
+
+4. **查看结果**：
+   - 系统会自动选择合适的图表类型
+   - 展示 SQL 查询详情
+   - 显示 NLP 分析结果（如果涉及评论）
+   - 提供决策建议
+
+### 10.5 数据传递格式
+
+#### 数据分析 Agent 输出格式
+```json
+{
+  "question": "用户问题",
+  "sql": "执行的SQL语句",
+  "used_view": true,
+  "view_name": "mv_xxx",
+  "data": [...],
+  "summary": "统计摘要"
+}
+```
+
+#### 可视化 Agent 输出格式
+```json
+{
+  "chart_type": "bar_chart",
+  "chart_path": "outputs/charts/xxx.json",
+  "chart_title": "图表标题",
+  "chart_insight": "图表解释"
+}
+```
+
+#### NLP Agent 输出格式
+```json
+{
+  "sentiment_score": 0.75,
+  "positive_keywords": ["good", "fast"],
+  "negative_keywords": ["slow", "broken"],
+  "main_complaints": ["配送延迟"],
+  "related_sellers_or_categories": ["电子产品"]
+}
+```
+
+#### 决策 Agent 输出格式
+```json
+{
+  "business_problem": "识别出的业务问题",
+  "recommendations": ["建议1", "建议2"],
+  "priority": "high",
+  "expected_impact": "预期影响",
+  "evidence": "依据的数据和分析结果"
+}
 ```

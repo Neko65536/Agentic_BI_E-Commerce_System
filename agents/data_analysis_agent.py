@@ -370,7 +370,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             f"你使用了 {matched_view} 但粒度错误。该视图粒度为 YEAR-MONTH × {dim}，"
             f"计算整体占比时需先 GROUP BY {dim} 并用 SUM({metric}) 聚合，"
             f"再基于聚合结果计算百分比。\n"
-            f"注意：year_month 是 MySQL 9.x 保留关键字，所有出现 year_month 的地方都必须加反引号(\`year_month\`)。"
+            f"注意：year_month 是 MySQL 9.x 保留关键字，所有出现 year_month 的地方都必须加反引号(`year_month`)。"
         )
         sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
         view_name = retry_raw.get("view_name")
