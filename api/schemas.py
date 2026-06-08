@@ -21,6 +21,8 @@ class AskResponseData(BaseModel):
     analysis_type: str
     intent: str
     sql: str
+    used_view: bool = False
+    view_name: str | None = None
     row_count: int
     summary: str
     final_answer: str

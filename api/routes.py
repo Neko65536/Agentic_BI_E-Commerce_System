@@ -59,6 +59,7 @@ async def ask_question(body: AskRequest):
             ),
         )
         save_turn(session_id, body.question, result)
+        data_analysis = result.get("data_analysis") or {}
         return AskResponse(
             success=True,
             data=AskResponseData(
@@ -67,6 +68,8 @@ async def ask_question(body: AskRequest):
                 analysis_type=result.get("coordinator_plan", {}).get("analysis_type", ""),
                 intent=result.get("coordinator_plan", {}).get("intent", ""),
                 sql=result.get("sql", ""),
+                used_view=bool(data_analysis.get("used_view", False)),
+                view_name=data_analysis.get("view_name"),
                 row_count=result.get("row_count", 0),
                 summary=result.get("summary", ""),
                 final_answer=result.get("final_answer", ""),

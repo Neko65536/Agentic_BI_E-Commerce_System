@@ -89,7 +89,9 @@ def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
     preferred = [
         "total_gmv", "gmv_total", "total_orders", "total_transactions", "total_value",
         "avg_basket", "avg_delivery_days", "on_time_rate", "delayed_orders",
-        "avg_review_score", "avg_rating", "negative_reviews", "review_count",
+        "avg_review_score", "avg_rating", "negative_review_count", "negative_reviews",
+        "negative_count", "bad_review_count", "bad_reviews", "bad_count",
+        "complaint_count", "review_count", "total_negative_reviews", "cnt",
         "predicted_gmv", "freight_value", "price", "count",
     ]
     numeric = _numeric_fields(rows)
@@ -102,7 +104,8 @@ def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
 def _pick_label(rows: list[dict[str, Any]]) -> str | None:
     preferred = [
         "year_month", "week_start", "customer_state", "seller_state",
-        "product_category_english", "payment_type", "seller_id", "reason", "keyword",
+        "category", "product_category_name_english", "product_category_english",
+        "payment_type", "seller_id", "reason", "keyword",
     ]
     labels = _label_fields(rows)
     for key in preferred:
@@ -129,7 +132,21 @@ def _scale(value: float, low: float, high: float, out_low: float, out_high: floa
 
 
 def _svg_bar(rows: list[dict[str, Any]], label_key: str, metric_key: str) -> str:
-    data = rows[:20]
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        label = str(row.get(label_key, ""))
+        if not label:
+            continue
+        value = _to_float(row.get(metric_key)) or 0.0
+        current = grouped.get(label)
+        if current is None or value > (_to_float(current.get(metric_key)) or 0.0):
+            grouped[label] = row
+
+    data = sorted(
+        grouped.values() if grouped else rows,
+        key=lambda item: _to_float(item.get(metric_key)) or 0.0,
+        reverse=True,
+    )[:20]
     values = [_to_float(row.get(metric_key)) or 0.0 for row in data]
     max_value = max(values) if values else 0.0
     width = 900
@@ -378,10 +395,10 @@ def _infer_chart_type(recommended: str | None, rows: list[dict[str, Any]]) -> st
     numeric = _numeric_fields(rows)
     labels = _label_fields(rows)
     label_key = _pick_label(rows) or ""
-    if len(labels) >= 2 and numeric:
-        return "matrix_heatmap"
     if recommended in {"line_chart", "bar_chart", "table", "big_number_card"}:
         return recommended
+    if len(labels) >= 2 and numeric:
+        return "matrix_heatmap"
     if "month" in label_key or "date" in label_key or "week" in label_key:
         return "line_chart"
     if labels and numeric:

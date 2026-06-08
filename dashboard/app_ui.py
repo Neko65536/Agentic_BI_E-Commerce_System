@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ if str(ROOT) not in sys.path:
 # 从环境变量读取后端端口，默认 3000
 BACKEND_PORT = os.getenv("PORT", "3000")
 API_BASE_URL = f"http://localhost:{BACKEND_PORT}/api"
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "180"))
 
 
 def init_session_state():
@@ -46,6 +48,23 @@ def init_session_state():
         st.session_state.is_typing = False
     if "last_send_status" not in st.session_state:
         st.session_state.last_send_status = None
+    if "last_error_message" not in st.session_state:
+        st.session_state.last_error_message = ""
+
+
+def split_questions(raw_text: str) -> list[str]:
+    """Split pasted multi-line questions into independent user questions."""
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return [raw_text.strip()] if raw_text.strip() else []
+
+    questions: list[str] = []
+    for line in lines:
+        cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.、)]|[（(]\d+[）)])\s*", "", line)
+        cleaned = cleaned.strip().strip("“”\"'`")
+        if cleaned:
+            questions.append(cleaned)
+    return questions
 
 
 def call_api(endpoint: str, method: str = "GET", **kwargs):
@@ -53,9 +72,9 @@ def call_api(endpoint: str, method: str = "GET", **kwargs):
     url = f"{API_BASE_URL}/{endpoint}"
     try:
         if method == "POST":
-            response = requests.post(url, json=kwargs, timeout=60)
+            response = requests.post(url, json=kwargs, timeout=API_TIMEOUT_SECONDS)
         else:
-            response = requests.get(url, params=kwargs, timeout=60)
+            response = requests.get(url, params=kwargs, timeout=API_TIMEOUT_SECONDS)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.ConnectionError:
@@ -81,6 +100,7 @@ def ask_question(question: str) -> dict | None:
     
     if result and result.get("success"):
         st.session_state.last_send_status = "success"
+        st.session_state.last_error_message = ""
         
         if st.session_state.session_id is None:
             st.session_state.session_id = result["data"]["session_id"]
@@ -95,6 +115,7 @@ def ask_question(question: str) -> dict | None:
         return result["data"]
     else:
         st.session_state.last_send_status = "error"
+        st.session_state.last_error_message = (result or {}).get("error", "未知错误")
         return None
 
 
@@ -190,9 +211,50 @@ def display_bar_chart(result: dict, chart: dict = None):
             numeric_cols = [col for col in df.columns if df[col].dtype in ["int64", "float64"]]
             
             if cat_cols and numeric_cols:
-                fig = px.bar(df, x=cat_cols[0], y=numeric_cols[:3],
+                preferred_labels = [
+                    "category",
+                    "product_category_name_english",
+                    "product_category_english",
+                    "payment_type",
+                    "customer_state",
+                    "seller_id",
+                ]
+                preferred_metrics = [
+                    "negative_review_count",
+                    "negative_reviews",
+                    "negative_count",
+                    "bad_review_count",
+                    "bad_reviews",
+                    "bad_count",
+                    "complaint_count",
+                    "review_count",
+                    "total_negative_reviews",
+                    "cnt",
+                    "count",
+                ]
+                chart_label = chart.get("label_key") if chart else None
+                chart_metric = chart.get("metric_key") if chart else None
+                x_col = chart_label if chart_label in df.columns else next(
+                    (col for col in preferred_labels if col in df.columns),
+                    cat_cols[0],
+                )
+                metric_col = chart_metric if chart_metric in df.columns else next(
+                    (col for col in preferred_metrics if col in df.columns),
+                    numeric_cols[0],
+                )
+                y_cols = [metric_col]
+
+                if df[x_col].duplicated().any():
+                    df = (
+                        df.groupby(x_col, as_index=False)[y_cols]
+                        .max()
+                        .sort_values(y_cols[0], ascending=False)
+                        .head(20)
+                    )
+
+                fig = px.bar(df, x=x_col, y=y_cols,
                              title=chart.get("chart_title", "数据对比"),
-                             labels={cat_cols[0]: cat_cols[0]},
+                             labels={x_col: x_col},
                              template="plotly_white")
                 fig.update_layout(height=350)
                 st.plotly_chart(fig, use_container_width=True)
@@ -954,7 +1016,8 @@ def main():
         if st.session_state.last_send_status == "success":
             st.markdown('<span class="status-success">✓ 发送成功</span>', unsafe_allow_html=True)
         elif st.session_state.last_send_status == "error":
-            st.markdown('<span class="status-error">✗ 发送失败，请重试</span>', unsafe_allow_html=True)
+            error_text = st.session_state.last_error_message or "请重试"
+            st.markdown(f'<span class="status-error">✗ 发送失败：{error_text}</span>', unsafe_allow_html=True)
         
         # Input area with professional styling
         st.markdown('<div class="input-container">', unsafe_allow_html=True)
@@ -976,6 +1039,46 @@ def main():
                     type="primary",
                     disabled=st.session_state.is_typing
                 )
+
+        if submit_button:
+            question = user_input.strip()
+            if question:
+                questions = split_questions(question)
+                st.session_state.messages.append({"content": question, "is_user": True})
+                st.session_state.last_send_status = None
+
+                if len(questions) == 1:
+                    with st.spinner("分析中..."):
+                        result = ask_question(questions[0])
+
+                    if result:
+                        final_answer = result.get("final_answer", "暂无分析结果")
+                        st.session_state.messages.append({"content": final_answer, "is_user": False})
+                        st.session_state.last_result = result
+                else:
+                    batch_answers = []
+                    with st.spinner(f"检测到{len(questions)}个问题，正在逐个分析..."):
+                        for idx, item in enumerate(questions, 1):
+                            result = ask_question(item)
+                            if not result:
+                                error_text = st.session_state.last_error_message or "未知错误"
+                                batch_answers.append(f"问题{idx}: {item}\n分析失败：{error_text}")
+                                break
+
+                            final_answer = result.get("final_answer", "暂无分析结果")
+                            batch_answers.append(f"问题{idx}: {item}\n{final_answer}")
+                            st.session_state.last_result = result
+
+                    if batch_answers:
+                        st.session_state.messages.append({
+                            "content": "\n\n".join(batch_answers),
+                            "is_user": False,
+                        })
+
+                st.rerun()
+            else:
+                st.session_state.last_send_status = "error"
+                st.rerun()
         
         st.markdown('</div>', unsafe_allow_html=True)
         
