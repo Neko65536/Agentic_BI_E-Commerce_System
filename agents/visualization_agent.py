@@ -88,8 +88,9 @@ def _label_fields(rows: list[dict[str, Any]]) -> list[str]:
 def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
     preferred = [
         "total_gmv", "gmv_total", "total_orders", "total_transactions", "total_value",
-        "avg_basket", "avg_delivery_days", "on_time_rate", "delayed_orders",
-        "avg_review_score", "avg_rating", "negative_review_count", "negative_reviews",
+        "avg_basket", "delivery_diff", "avg_delivery_days", "on_time_rate", "delayed_orders",
+        "avg_review_score", "avg_rating", "negative_rate",
+        "negative_review_count", "negative_reviews",
         "negative_count", "bad_review_count", "bad_reviews", "bad_count",
         "complaint_count", "review_count", "total_negative_reviews", "cnt",
         "predicted_gmv", "freight_value", "price", "count",
@@ -105,7 +106,7 @@ def _pick_label(rows: list[dict[str, Any]]) -> str | None:
     preferred = [
         "year_month", "week_start", "customer_state", "seller_state",
         "category", "product_category_name_english", "product_category_english",
-        "payment_type", "seller_id", "reason", "keyword",
+        "payment_type", "seller_label", "seller_id", "reason", "keyword",
     ]
     labels = _label_fields(rows)
     for key in preferred:
@@ -477,6 +478,7 @@ def _create_chart(question: str, chart_type: str, rows: list[dict[str, Any]], su
         "label_key": label_key,
         "metric_key": metric_key,
         "row_count": len(rows),
+        "data": {"data": rows},
     }
 
 
@@ -522,7 +524,96 @@ def _create_word_cloud(question: str, words: list[tuple[str, int | float]]) -> d
         "label_key": "keyword",
         "metric_key": "count",
         "row_count": len(words),
+        "data": {"data": [{"keyword": word, "count": count} for word, count in words]},
     }
+
+
+def _delivery_seller_split_charts(question: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Split the common diagnostic query that returns two business entities:
+    state delivery outliers and high-negative-rate sellers.
+
+    Drawing those rows in one chart mixes customer_state and seller_id, which
+    can collapse into placeholder labels. Separate charts keep the metric and
+    dimension aligned.
+    """
+    state_rows: list[dict[str, Any]] = []
+    seller_rows: list[dict[str, Any]] = []
+
+    for row in rows:
+        result_type = str(
+            row.get("result_type")
+            or row.get("analysis_type")
+            or row.get("entity_type")
+            or ""
+        ).lower()
+        state = row.get("customer_state")
+        seller = row.get("seller_id")
+        entity_id = row.get("entity_id")
+        if not state and "state" in result_type and entity_id:
+            state = entity_id
+        if not seller and "seller" in result_type and entity_id:
+            seller = entity_id
+
+        if "state" in result_type and state:
+            state_rows.append({
+                "customer_state": state,
+                "delivery_diff": row.get("delivery_diff") if row.get("delivery_diff") is not None else row.get("value3"),
+                "avg_delivery_days": (
+                    row.get("avg_delivery_days")
+                    if row.get("avg_delivery_days") is not None
+                    else row.get("state_avg_delivery_days")
+                    if row.get("state_avg_delivery_days") is not None
+                    else row.get("value1")
+                ),
+                "national_avg_delivery_days": (
+                    row.get("national_avg_delivery_days")
+                    if row.get("national_avg_delivery_days") is not None
+                    else row.get("value2")
+                ),
+            })
+        elif "seller" in result_type and seller:
+            seller_text = str(seller)
+            seller_rows.append({
+                "seller_id": seller,
+                "seller_label": seller_text,
+                "negative_rate": row.get("negative_rate") if row.get("negative_rate") is not None else row.get("value3"),
+                "negative_reviews": (
+                    row.get("negative_reviews")
+                    if row.get("negative_reviews") is not None
+                    else row.get("negative_orders")
+                    if row.get("negative_orders") is not None
+                    else row.get("value2")
+                ),
+                "review_count": (
+                    row.get("review_count")
+                    if row.get("review_count") is not None
+                    else row.get("total_orders")
+                    if row.get("total_orders") is not None
+                    else row.get("value1")
+                ),
+            })
+
+    charts: list[dict[str, Any]] = []
+    if state_rows:
+        state_rows = sorted(
+            state_rows,
+            key=lambda item: _to_float(item.get("delivery_diff")) or 0.0,
+            reverse=True,
+        )
+        charts.append(_create_chart(question, "bar_chart", state_rows, "state_delivery"))
+    if seller_rows:
+        seller_rows = sorted(
+            seller_rows,
+            key=lambda item: _to_float(item.get("negative_rate")) or 0.0,
+            reverse=True,
+        )
+        for index, row in enumerate(seller_rows, start=1):
+            seller_id = str(row.get("seller_id") or "")
+            row["seller_label"] = f"卖家{index:02d}-{seller_id[:8]}"
+        charts.append(_create_chart(question, "bar_chart", seller_rows, "seller_negative_rate"))
+
+    return charts if state_rows and seller_rows else []
 
 
 def run_visualization_agent(payload: dict[str, Any]) -> dict[str, Any]:
@@ -531,8 +622,10 @@ def run_visualization_agent(payload: dict[str, Any]) -> dict[str, Any]:
         rows = []
 
     question = str(payload.get("question") or "BI分析结果")
-    primary_type = _infer_chart_type(payload.get("recommended_chart"), rows)
-    charts = [_create_chart(question, primary_type, rows, "primary")]
+    charts = _delivery_seller_split_charts(question, rows)
+    if not charts:
+        primary_type = _infer_chart_type(payload.get("recommended_chart"), rows)
+        charts = [_create_chart(question, primary_type, rows, "primary")]
 
     forecast_rows = _forecast_rows(payload)
     if forecast_rows:

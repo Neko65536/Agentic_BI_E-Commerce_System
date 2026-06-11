@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+import pandas as pd
 import streamlit as st
 from streamlit_chat import message
 
@@ -124,6 +125,17 @@ def toggle_section(section_name: str):
     st.session_state.expanded_sections[section_name] = not st.session_state.expanded_sections.get(section_name, True)
 
 
+def get_chart_rows(result: dict, chart: dict | None = None) -> list:
+    """Return chart-scoped rows before falling back to the full analysis rows."""
+    if chart:
+        chart_data = chart.get("data")
+        if isinstance(chart_data, dict) and isinstance(chart_data.get("data"), list):
+            return chart_data["data"]
+        if isinstance(chart_data, list):
+            return chart_data
+    return result.get("downstream_payload", {}).get("data", [])
+
+
 def display_visualization(result: dict):
     """Display visualization results with collapsible sections."""
     viz_result = result.get("visualization_result")
@@ -172,9 +184,7 @@ def display_line_chart(result: dict, chart: dict = None):
         import pandas as pd
         import plotly.express as px
         
-        data = result.get("downstream_payload", {}).get("data", [])
-        if not data:
-            data = chart.get("data", {}).get("data", [])
+        data = get_chart_rows(result, chart)
         
         if data:
             df = pd.DataFrame(data)
@@ -201,9 +211,7 @@ def display_bar_chart(result: dict, chart: dict = None):
         import pandas as pd
         import plotly.express as px
         
-        data = result.get("downstream_payload", {}).get("data", [])
-        if not data:
-            data = chart.get("data", {}).get("data", [])
+        data = get_chart_rows(result, chart)
         
         if data:
             df = pd.DataFrame(data)
@@ -217,9 +225,13 @@ def display_bar_chart(result: dict, chart: dict = None):
                     "product_category_english",
                     "payment_type",
                     "customer_state",
+                    "seller_label",
                     "seller_id",
                 ]
                 preferred_metrics = [
+                    "delivery_diff",
+                    "negative_rate",
+                    "avg_delivery_days",
                     "negative_review_count",
                     "negative_reviews",
                     "negative_count",
@@ -243,6 +255,7 @@ def display_bar_chart(result: dict, chart: dict = None):
                     numeric_cols[0],
                 )
                 y_cols = [metric_col]
+                df = df[df[x_col].notna() & df[metric_col].notna()]
 
                 if df[x_col].duplicated().any():
                     df = (
@@ -252,12 +265,14 @@ def display_bar_chart(result: dict, chart: dict = None):
                         .head(20)
                     )
 
-                fig = px.bar(df, x=x_col, y=y_cols,
-                             title=chart.get("chart_title", "数据对比"),
-                             labels={x_col: x_col},
-                             template="plotly_white")
-                fig.update_layout(height=350)
-                st.plotly_chart(fig, use_container_width=True)
+                if not df.empty:
+                    df = df.sort_values(metric_col, ascending=False).head(20)
+                    fig = px.bar(df, x=x_col, y=y_cols,
+                                 title=chart.get("chart_title", "数据对比"),
+                                 labels={x_col: x_col},
+                                 template="plotly_white")
+                    fig.update_layout(height=350)
+                    st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
         st.warning(f"图表渲染失败: {str(e)}")
 
@@ -268,9 +283,7 @@ def display_geo_chart(result: dict, chart: dict = None):
         import pandas as pd
         import plotly.express as px
         
-        data = result.get("downstream_payload", {}).get("data", [])
-        if not data:
-            data = chart.get("data", {}).get("data", [])
+        data = get_chart_rows(result, chart)
         
         if data:
             df = pd.DataFrame(data)
@@ -378,9 +391,7 @@ def display_heatmap(result: dict, chart: dict = None):
         import pandas as pd
         import plotly.express as px
         
-        data = result.get("downstream_payload", {}).get("data", [])
-        if not data:
-            data = chart.get("data", {}).get("data", [])
+        data = get_chart_rows(result, chart)
         
         if data:
             df = pd.DataFrame(data)
@@ -407,9 +418,7 @@ def display_scatter_chart(result: dict, chart: dict = None):
         import pandas as pd
         import plotly.express as px
         
-        data = result.get("downstream_payload", {}).get("data", [])
-        if not data:
-            data = chart.get("data", {}).get("data", [])
+        data = get_chart_rows(result, chart)
         
         if data:
             df = pd.DataFrame(data)
@@ -436,9 +445,7 @@ def display_scatter_chart(result: dict, chart: dict = None):
 
 def display_big_number(result: dict, chart: dict = None):
     """Display big number card."""
-    data = result.get("downstream_payload", {}).get("data", [])
-    if not data and chart:
-        data = [chart.get("data", {})]
+    data = get_chart_rows(result, chart)
     
     if data and len(data) >= 1:
         first_row = data[0] if isinstance(data[0], dict) else data[0]
@@ -457,9 +464,7 @@ def display_big_number(result: dict, chart: dict = None):
 
 def display_data_table(result: dict, chart: dict = None):
     """Display data table."""
-    data = result.get("downstream_payload", {}).get("data", [])
-    if not data and chart:
-        data = chart.get("data", {}).get("data", [])
+    data = get_chart_rows(result, chart)
     
     if data:
         df = pd.DataFrame(data)

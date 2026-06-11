@@ -304,8 +304,8 @@ seller_reviews AS (
            NULL AS national_avg_delivery_days,
            NULL AS delivery_diff,
            COUNT(DISTINCT r.review_id) AS review_count,
-           SUM(CASE WHEN r.review_score <= 2 THEN 1 ELSE 0 END) AS negative_reviews,
-           SUM(CASE WHEN r.review_score <= 2 THEN 1 ELSE 0 END) / COUNT(DISTINCT r.review_id) AS negative_rate
+           COUNT(DISTINCT CASE WHEN r.review_score <= 2 THEN r.review_id END) AS negative_reviews,
+           COUNT(DISTINCT CASE WHEN r.review_score <= 2 THEN r.review_id END) / COUNT(DISTINCT r.review_id) AS negative_rate
     FROM order_items oi
     JOIN order_reviews r ON oi.order_id = r.order_id
     GROUP BY oi.seller_id
@@ -490,6 +490,23 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
     """
     Ask the DataAnalysisAgent LLM to produce SQL and metadata.
     """
+    q = _normalize_question(question)
+    if (
+        "卖家" in q
+        and "差评率" in q
+        and ("配送" in q or "配送时长" in q)
+        and ("全国均值" in q or "州" in q)
+    ):
+        deterministic_plan = deterministic_required_view_plan(
+            question,
+            required_views_for_question(question),
+        )
+        if deterministic_plan:
+            print("=========数据分析Agent-使用混合诊断稳定查询计划：============")
+            print(deterministic_plan)
+            print("==========================================")
+            return deterministic_plan
+
     data_dictionary = load_data_dictionary_context()
     pre_aggregate_policy = load_pre_aggregate_policy_context()
 
