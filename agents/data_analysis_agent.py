@@ -274,6 +274,117 @@ ORDER BY cancellation_rate DESC
     })
 
 
+def is_state_geo_sales_question(question: str) -> bool:
+    """Detect requests that should produce a Brazil state sales map."""
+    q = _normalize_question(question)
+    has_state = any(token in q for token in ["各州", "州", "state", "states"])
+    has_sales = any(token in q for token in ["销售额", "gmv", "订单量", "sales", "orders"])
+    has_map = any(token in q for token in ["地图", "地理", "热力", "气泡", "map", "geo", "bubble"])
+    return has_state and has_sales and has_map
+
+
+def deterministic_state_geo_sales_plan(question: str) -> dict[str, Any]:
+    """Stable state-level sales query for geographic bubble/heat maps."""
+    q = _normalize_question(question)
+    year_filter = "WHERE `year_month` LIKE '2017-%'" if "2017" in q else ""
+    sql = f"""
+SELECT customer_state,
+       SUM(total_gmv) AS total_gmv,
+       SUM(total_orders) AS total_orders,
+       SUM(unique_customers) AS unique_customers
+FROM mv_state_sales
+{year_filter}
+GROUP BY customer_state
+ORDER BY total_gmv DESC
+""".strip()
+    return build_sql_plan_from_raw({
+        "sql": sql,
+        "used_view": True,
+        "view_name": "mv_state_sales",
+        "summary_intent": "按州汇总销售额、订单量和客户数，用于巴西州级地理气泡图展示。",
+    })
+
+
+def is_payment_heatmap_question(question: str) -> bool:
+    """Detect payment type x installment heatmap/matrix questions."""
+    q = _normalize_question(question)
+    has_payment = any(token in q for token in ["支付", "payment"])
+    has_installment = any(token in q for token in ["分期", "installment"])
+    has_matrix = any(token in q for token in ["热力图", "矩阵", "heatmap", "matrix"])
+    return has_payment and has_installment and has_matrix
+
+
+def deterministic_payment_heatmap_plan(question: str) -> dict[str, Any]:
+    """Stable payment x installment matrix from the payments fact table."""
+    sql = """
+SELECT payment_type,
+       payment_installments,
+       COUNT(*) AS total_transactions,
+       SUM(payment_value) AS total_value,
+       AVG(payment_value) AS avg_payment_value
+FROM payments
+GROUP BY payment_type, payment_installments
+ORDER BY payment_type, payment_installments
+""".strip()
+    return build_sql_plan_from_raw({
+        "sql": sql,
+        "used_view": False,
+        "view_name": None,
+        "summary_intent": "按支付方式和分期数构造成交矩阵，用于热力图展示。",
+    })
+
+
+def is_product_freight_scatter_question(question: str) -> bool:
+    """Detect product weight/dimension vs freight scatter/bubble questions."""
+    q = _normalize_question(question)
+    has_product = any(token in q for token in ["产品", "商品", "product"])
+    has_freight = any(token in q for token in ["运费", "freight"])
+    has_size = any(token in q for token in ["重量", "尺寸", "体积", "weight", "dimension", "size"])
+    return has_product and has_freight and has_size
+
+
+def deterministic_product_freight_scatter_plan(question: str) -> dict[str, Any]:
+    """Stable product-weight/freight query for scatter/bubble charts."""
+    sql = """
+SELECT p.product_weight_g,
+       p.product_length_cm,
+       p.product_height_cm,
+       p.product_width_cm,
+       p.product_length_cm * p.product_height_cm * p.product_width_cm AS product_volume_cm3,
+       oi.freight_value,
+       COUNT(*) AS total_orders,
+       AVG(oi.price) AS avg_price,
+       o.order_status,
+       COALESCE(t.product_category_name_english, p.product_category_name) AS product_category_english
+FROM order_items oi
+JOIN products p ON p.product_id = oi.product_id
+JOIN orders o ON o.order_id = oi.order_id
+LEFT JOIN product_category_name_translation t
+       ON t.product_category_name = p.product_category_name
+WHERE p.product_weight_g IS NOT NULL
+  AND p.product_length_cm IS NOT NULL
+  AND p.product_height_cm IS NOT NULL
+  AND p.product_width_cm IS NOT NULL
+  AND oi.freight_value IS NOT NULL
+GROUP BY p.product_weight_g,
+         p.product_length_cm,
+         p.product_height_cm,
+         p.product_width_cm,
+         product_volume_cm3,
+         oi.freight_value,
+         o.order_status,
+         product_category_english
+ORDER BY total_orders DESC, freight_value DESC
+LIMIT 1000
+""".strip()
+    return build_sql_plan_from_raw({
+        "sql": sql,
+        "used_view": False,
+        "view_name": None,
+        "summary_intent": "查询商品重量、尺寸、体积与运费的关系，并按订单量和配送状态支持散点/气泡图。",
+    })
+
+
 def required_views_for_question(question: str) -> list[str]:
     """
     Return view coverage requirements for explicit multi-metric questions.
@@ -594,6 +705,16 @@ def validate_mysql_surface_sql(sql: str) -> str | None:
         return "rank是MySQL窗口函数相关保留词，不要作为列别名；请改用state_rank、rank_value或ranking。"
 
     lowered = sql.lower()
+    if (
+        re.search(r"\b(json_arrayagg|group_concat)\s*\(", lowered)
+        and re.search(r"(review_comment|comment_message|message|text)", lowered)
+    ):
+        return (
+            "不要对评论长文本使用JSON_ARRAYAGG或GROUP_CONCAT，这会导致MySQL排序/聚合内存风险。"
+            "请只聚合计数、评分、品类等结构化指标；如需评论原因，返回少量样本文本字段，"
+            "例如MIN(NULLIF(review_comment_message,'')) AS sample_reason，或把明细行LIMIT后交给NLP处理。"
+        )
+
     if "union all" in lowered and re.search(r"\border\s+by\b[\s\S]*\brnk\b", lowered):
         return "UNION查询的ORDER BY不能引用CTE内部别名rnk；请使用最终输出列别名，或用外层SELECT包装后排序。"
 
@@ -673,6 +794,27 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
     if is_northeast_cancellation_question(question):
         deterministic_plan = deterministic_northeast_cancellation_plan(question)
         print("=========数据分析Agent-使用东北部取消率稳定查询计划：============")
+        print(deterministic_plan)
+        print("==========================================")
+        return deterministic_plan
+
+    if is_state_geo_sales_question(question):
+        deterministic_plan = deterministic_state_geo_sales_plan(question)
+        print("=========数据分析Agent-使用州级地理图稳定查询计划：============")
+        print(deterministic_plan)
+        print("==========================================")
+        return deterministic_plan
+
+    if is_payment_heatmap_question(question):
+        deterministic_plan = deterministic_payment_heatmap_plan(question)
+        print("=========数据分析Agent-使用支付热力图稳定查询计划：============")
+        print(deterministic_plan)
+        print("==========================================")
+        return deterministic_plan
+
+    if is_product_freight_scatter_question(question):
+        deterministic_plan = deterministic_product_freight_scatter_plan(question)
+        print("=========数据分析Agent-使用商品运费散点图稳定查询计划：============")
         print(deterministic_plan)
         print("==========================================")
         return deterministic_plan
@@ -769,9 +911,31 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             {"role": "user", "content": guard_prompt},
         ])
 
+    def _has_multiple_statements(sql_text: str) -> bool:
+        cleaned = sql_text.strip().rstrip(";").strip()
+        return ";" in cleaned
+
+    def _validate_single_statement(raw_candidate: dict[str, Any], context: str) -> tuple[dict[str, Any], str]:
+        sql_text = str(raw_candidate.get("sql", ""))
+        try:
+            return raw_candidate, validate_readonly_sql(sql_text)
+        except ValueError as exc:
+            if not _has_multiple_statements(sql_text) and "多条" not in str(exc):
+                raise
+
+            retry_raw = _call_llm(
+                f"{context}返回了多条SQL或包含分号分隔的多语句，已被安全校验拒绝。"
+                "必须重写为一条且仅一条MySQL SELECT或WITH查询。"
+                "如果需要多个分析结果，使用WITH CTE分别计算，再用UNION ALL合并为同一结果集；"
+                "也可以用section/result_type字段区分不同分析块。"
+                "不要返回多条SELECT语句，不要用分号分隔多条SQL，不要返回DDL/DML。"
+                f"上一次不合规SQL为：\n{sql_text[:4000]}"
+            )
+            return retry_raw, validate_readonly_sql(str(retry_raw.get("sql", "")))
+
     raw = _call_llm()
 
-    sql = validate_readonly_sql(str(raw.get("sql", "")))
+    raw, sql = _validate_single_statement(raw, "初始SQL")
     view_name = raw.get("view_name")
     if view_name in ("", "null", "None"):
         view_name = None
@@ -800,7 +964,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             f"再基于聚合结果计算百分比。\n"
             f"注意：year_month 是 MySQL 9.x 保留关键字，所有出现 year_month 的地方都必须加反引号(`year_month`)。"
         )
-        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        retry_raw, sql = _validate_single_statement(retry_raw, "粒度语义修复SQL")
         view_name = retry_raw.get("view_name")
         if view_name in ("", "null", "None"):
             view_name = None
@@ -827,6 +991,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
                 f"这是第{retry_index + 1}次自动重生成，不能省略任何必需视图。"
             )
             try:
+                retry_raw, _ = _validate_single_statement(retry_raw, "缺失视图重试SQL")
                 retry_plan = build_sql_plan_from_raw(retry_raw)
                 semantic_error = validate_distribution_grain(retry_plan["sql"])
                 if semantic_error:
@@ -884,7 +1049,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             "如果问题还有配送时长诊断，也要保留 mv_delivery_perf 对州级配送表现的分析；"
             "如果问题询问卖家差评率，必须返回negative_rate。"
         )
-        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        retry_raw, sql = _validate_single_statement(retry_raw, "缺失诊断指标修复SQL")
         view_name = retry_raw.get("view_name")
         if view_name in ("", "null", "None"):
             view_name = None
@@ -929,7 +1094,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             f"{surface_error}"
             "请重新生成一条可执行的MySQL SELECT或WITH查询，仍需完整回答用户问题。"
         )
-        sql = validate_readonly_sql(str(retry_raw.get("sql", "")))
+        retry_raw, sql = _validate_single_statement(retry_raw, "MySQL表面语法修复SQL")
         view_name = retry_raw.get("view_name")
         if view_name in ("", "null", "None"):
             view_name = None
@@ -1166,6 +1331,16 @@ def repair_sql_plan_after_error(
 }}
 """.strip()
 
+    error_text = str(error)
+    performance_hint = ""
+    if "Out of sort memory" in error_text or "sort buffer" in error_text:
+        performance_hint = (
+            "\n性能修复要求：上一次SQL触发了MySQL排序/聚合内存错误。"
+            "不要使用JSON_ARRAYAGG、GROUP_CONCAT聚合评论长文本；"
+            "请改为返回结构化聚合指标和少量样本文本，例如COUNT(*)、AVG(review_score)、"
+            "MIN(NULLIF(review_comment_message,'')) AS sample_reason，并控制LIMIT。"
+        )
+
     user_prompt = f"""
 用户问题：
 {question}
@@ -1178,6 +1353,7 @@ def repair_sql_plan_after_error(
 
 MySQL/SQLAlchemy 报错：
 {error}
+{performance_hint}
 
 请修复 SQL，并保持查询口径能回答用户问题。
 """.strip()
@@ -1187,7 +1363,27 @@ MySQL/SQLAlchemy 报错：
         {"role": "user", "content": user_prompt},
     ])
 
-    sql = validate_readonly_sql(str(raw.get("sql", "")))
+    sql_text = str(raw.get("sql", ""))
+    try:
+        sql = validate_readonly_sql(sql_text)
+    except ValueError as exc:
+        cleaned = sql_text.strip().rstrip(";").strip()
+        if ";" not in cleaned and "多条" not in str(exc):
+            raise
+        raw = LLMClient().chat_json([
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{user_prompt}\n\n"
+                    "额外约束：上一次修复SQL仍然包含多条语句或分号分隔语句。"
+                    "请重写为一条且仅一条MySQL SELECT或WITH查询。"
+                    "多个分析块必须用WITH CTE和UNION ALL合并到同一个结果集，"
+                    "并用section/result_type字段区分，不要返回多条SELECT。"
+                ),
+            },
+        ])
+        sql = validate_readonly_sql(str(raw.get("sql", "")))
     view_name = raw.get("view_name")
     if view_name in ("", "null", "None"):
         view_name = None

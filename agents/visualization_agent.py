@@ -91,6 +91,50 @@ def _label_fields(rows: list[dict[str, Any]]) -> list[str]:
     return [key for key in rows[0] if key not in numeric]
 
 
+def _canonicalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add stable chart-facing aliases without dropping original fields."""
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if "customer_state" not in item:
+            for key in ("state", "uf", "geolocation_state"):
+                if item.get(key):
+                    item["customer_state"] = item.get(key)
+                    break
+        if "total_gmv" not in item:
+            for key in ("sales", "state_sales", "gmv", "total_sales", "revenue"):
+                if item.get(key) is not None:
+                    item["total_gmv"] = item.get(key)
+                    break
+        if "total_orders" not in item:
+            for key in ("orders", "order_count", "count_orders"):
+                if item.get(key) is not None:
+                    item["total_orders"] = item.get(key)
+                    break
+        if "payment_installments" not in item:
+            for key in ("installments", "installment_count", "payment_installment"):
+                if item.get(key) is not None:
+                    item["payment_installments"] = item.get(key)
+                    break
+        if "product_weight_g" not in item:
+            for key in ("weight", "weight_g", "product_weight"):
+                if item.get(key) is not None:
+                    item["product_weight_g"] = item.get(key)
+                    break
+        if "freight_value" not in item:
+            for key in ("freight", "shipping_cost", "avg_freight", "freight_cost"):
+                if item.get(key) is not None:
+                    item["freight_value"] = item.get(key)
+                    break
+        if "product_volume_cm3" not in item:
+            for key in ("volume", "volume_cm3", "product_volume"):
+                if item.get(key) is not None:
+                    item["product_volume_cm3"] = item.get(key)
+                    break
+        normalized.append(item)
+    return normalized
+
+
 def _rate_metric_keys(keys: set[str]) -> set[str]:
     return keys & {
         "cancellation_rate", "return_rate", "cancel_rate",
@@ -131,12 +175,12 @@ def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
     preferred = [
         "cancellation_rate", "return_rate", "cancel_rate", "refund_rate",
         "total_gmv", "gmv_total", "total_orders", "total_transactions", "total_value",
-        "avg_basket", "delivery_diff", "avg_delivery_days", "on_time_rate", "delayed_orders",
+        "sales", "state_sales", "gmv", "avg_basket", "delivery_diff", "avg_delivery_days", "on_time_rate", "delayed_orders",
         "avg_review_score", "avg_rating", "negative_rate",
         "negative_review_count", "negative_reviews",
         "negative_count", "bad_review_count", "bad_reviews", "bad_count",
         "complaint_count", "review_count", "total_negative_reviews", "cnt",
-        "predicted_gmv", "freight_value", "price", "count",
+        "predicted_gmv", "freight_value", "freight", "price", "count",
     ]
     for key in preferred:
         if key in numeric:
@@ -151,7 +195,7 @@ def _pick_label(rows: list[dict[str, Any]]) -> str | None:
         return "seller_label"
 
     preferred = [
-        "year_month", "week_start", "customer_state", "seller_state",
+        "year_month", "week_start", "customer_state", "state", "seller_state",
         "category", "product_category_name_english", "product_category_english",
         "payment_type", "route_label", "seller_label", "seller_id", "reason", "keyword",
     ]
@@ -220,11 +264,18 @@ def _svg_line(rows: list[dict[str, Any]], label_key: str, metric_key: str) -> st
     if not values:
         return "<p>没有可绘制的数值数据。</p>"
 
+    lower_values = [_to_float(row.get("lower")) for row in data]
+    upper_values = [_to_float(row.get("upper")) for row in data]
+    has_interval = all(value is not None for value in lower_values + upper_values)
+    scale_values = list(values)
+    if has_interval:
+        scale_values.extend([value for value in lower_values + upper_values if value is not None])
+
     width = 900
     height = 360
     pad = 52
-    max_value = max(values)
-    min_value = min(values)
+    max_value = max(scale_values)
+    min_value = min(scale_values)
     span = max(max_value - min_value, 1.0)
     step = (width - pad * 2) / max(len(values) - 1, 1)
 
@@ -233,6 +284,24 @@ def _svg_line(rows: list[dict[str, Any]], label_key: str, metric_key: str) -> st
         x = pad + idx * step
         y = height - pad - ((value - min_value) / span) * (height - pad * 2)
         points.append((x, y))
+
+    interval_polygon = ""
+    if has_interval:
+        upper_points = []
+        lower_points = []
+        for idx, row in enumerate(data):
+            x = pad + idx * step
+            upper = _to_float(row.get("upper")) or 0.0
+            lower = _to_float(row.get("lower")) or 0.0
+            upper_y = height - pad - ((upper - min_value) / span) * (height - pad * 2)
+            lower_y = height - pad - ((lower - min_value) / span) * (height - pad * 2)
+            upper_points.append((x, upper_y))
+            lower_points.append((x, lower_y))
+        polygon_points = " ".join(
+            [f"{x:.1f},{y:.1f}" for x, y in upper_points]
+            + [f"{x:.1f},{y:.1f}" for x, y in reversed(lower_points)]
+        )
+        interval_polygon = f'<polygon points="{polygon_points}" fill="#14b8a6" fill-opacity="0.18"></polygon>'
 
     polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
     circles = "".join(
@@ -245,6 +314,7 @@ def _svg_line(rows: list[dict[str, Any]], label_key: str, metric_key: str) -> st
     <svg viewBox="0 0 {width} {height}" width="100%" role="img">
       <line x1="{pad}" y1="{height-pad}" x2="{width-pad}" y2="{height-pad}" stroke="#9ca3af"></line>
       <line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height-pad}" stroke="#9ca3af"></line>
+      {interval_polygon}
       <polyline points="{polyline}" fill="none" stroke="#0f766e" stroke-width="3"></polyline>
       {circles}
       <text x="{pad}" y="{height-14}" font-size="12">{start_label}</text>
@@ -479,7 +549,7 @@ def _build_body(chart_type: str, rows: list[dict[str, Any]]) -> tuple[str, str |
     if chart_type == "bar_chart" and label_key and metric_key:
         return _svg_bar(rows, label_key, metric_key), label_key, metric_key
     if chart_type == "geographic_bubble_map" and metric_key:
-        state_key = _first_existing(rows, ["customer_state", "seller_state", "geolocation_state"]) or label_key
+        state_key = _first_existing(rows, ["customer_state", "state", "seller_state", "geolocation_state"]) or label_key
         if state_key:
             return _svg_geo_bubble(rows, state_key, metric_key), state_key, metric_key
     if chart_type == "matrix_heatmap" and metric_key:
@@ -490,10 +560,10 @@ def _build_body(chart_type: str, rows: list[dict[str, Any]]) -> tuple[str, str |
         if len(labels) >= 2:
             return _svg_heatmap(rows, labels[0], labels[1], metric_key), f"{labels[0]} x {labels[1]}", metric_key
     if chart_type == "scatter_bubble_chart":
-        x_key = _first_existing(rows, ["product_weight_g", "product_length_cm", "price"])
-        y_key = _first_existing(rows, ["freight_value", "avg_price", "payment_value"])
+        x_key = _first_existing(rows, ["product_weight_g", "product_volume_cm3", "product_length_cm", "price"])
+        y_key = _first_existing(rows, ["freight_value", "freight", "avg_price", "payment_value"])
         size_key = _first_existing(rows, ["total_orders", "order_count", "review_count"])
-        color_key = _first_existing(rows, ["order_status", "product_category_english"])
+        color_key = _first_existing(rows, ["order_status", "product_category_english", "product_category_name_english"])
         if x_key and y_key:
             return _svg_scatter(rows, x_key, y_key, size_key, color_key), x_key, y_key
 
@@ -542,7 +612,27 @@ def _create_chart(question: str, chart_type: str, rows: list[dict[str, Any]], su
 def _forecast_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     forecast = payload.get("forecast_result") or {}
     values = forecast.get("forecast_values") or []
-    return values if isinstance(values, list) else []
+    if not isinstance(values, list):
+        return []
+
+    intervals = forecast.get("confidence_interval") or []
+    interval_by_week = {
+        str(item.get("week_start")): item
+        for item in intervals
+        if isinstance(item, dict) and item.get("week_start") is not None
+    } if isinstance(intervals, list) else {}
+
+    merged: list[dict[str, Any]] = []
+    for row in values:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        interval = interval_by_week.get(str(item.get("week_start")))
+        if interval:
+            item["lower"] = interval.get("lower")
+            item["upper"] = interval.get("upper")
+        merged.append(item)
+    return merged
 
 
 def _what_if_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -703,6 +793,7 @@ def run_visualization_agent(payload: dict[str, Any]) -> dict[str, Any]:
     rows = payload.get("data") or []
     if not isinstance(rows, list):
         rows = []
+    rows = _canonicalize_rows(rows)
 
     question = str(payload.get("question") or "BI分析结果")
     what_if_rows = _what_if_rows(payload)
