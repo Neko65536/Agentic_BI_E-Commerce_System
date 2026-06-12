@@ -120,6 +120,14 @@ def _aggregate_rows_by_state(
 
 
 def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
+    numeric = _numeric_fields(rows)
+    if rows and "route_label" in rows[0] and "delivery_diff" in numeric:
+        return "delivery_diff"
+    if rows and "seller_label" in rows[0] and "negative_rate" in numeric:
+        return "negative_rate"
+    if rows and "customer_state" in rows[0] and "delivery_diff" in numeric:
+        return "delivery_diff"
+
     preferred = [
         "cancellation_rate", "return_rate", "cancel_rate", "refund_rate",
         "total_gmv", "gmv_total", "total_orders", "total_transactions", "total_value",
@@ -130,7 +138,6 @@ def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
         "complaint_count", "review_count", "total_negative_reviews", "cnt",
         "predicted_gmv", "freight_value", "price", "count",
     ]
-    numeric = _numeric_fields(rows)
     for key in preferred:
         if key in numeric:
             return key
@@ -138,10 +145,15 @@ def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
 
 
 def _pick_label(rows: list[dict[str, Any]]) -> str | None:
+    if rows and "route_label" in rows[0]:
+        return "route_label"
+    if rows and "seller_label" in rows[0]:
+        return "seller_label"
+
     preferred = [
         "year_month", "week_start", "customer_state", "seller_state",
         "category", "product_category_name_english", "product_category_english",
-        "payment_type", "seller_label", "seller_id", "reason", "keyword",
+        "payment_type", "route_label", "seller_label", "seller_id", "reason", "keyword",
     ]
     labels = _label_fields(rows)
     for key in preferred:
@@ -584,6 +596,7 @@ def _delivery_seller_split_charts(question: str, rows: list[dict[str, Any]]) -> 
     """
     state_rows: list[dict[str, Any]] = []
     seller_rows: list[dict[str, Any]] = []
+    route_rows: list[dict[str, Any]] = []
 
     for row in rows:
         result_type = str(
@@ -600,7 +613,25 @@ def _delivery_seller_split_charts(question: str, rows: list[dict[str, Any]]) -> 
         if not seller and "seller" in result_type and entity_id:
             seller = entity_id
 
-        if "state" in result_type and state:
+        if "route" in result_type and state and row.get("seller_state"):
+            seller_state = str(row.get("seller_state") or "")
+            route_rows.append({
+                "route_label": f"{state}->{seller_state}",
+                "customer_state": state,
+                "seller_state": seller_state,
+                "route_type": str(row.get("route_type") or ""),
+                "delivery_diff": row.get("delivery_diff") if row.get("delivery_diff") is not None else row.get("value3"),
+                "avg_delivery_days": (
+                    row.get("avg_delivery_days")
+                    if row.get("avg_delivery_days") is not None
+                    else row.get("value1")
+                ),
+                "on_time_rate": row.get("on_time_rate"),
+                "delayed_orders": row.get("delayed_orders"),
+                "negative_rate": row.get("negative_rate"),
+                "total_orders": row.get("total_orders"),
+            })
+        elif "state" in result_type and state:
             state_rows.append({
                 "customer_state": state,
                 "delivery_diff": row.get("delivery_diff") if row.get("delivery_diff") is not None else row.get("value3"),
@@ -657,6 +688,13 @@ def _delivery_seller_split_charts(question: str, rows: list[dict[str, Any]]) -> 
             seller_id = str(row.get("seller_id") or "")
             row["seller_label"] = f"卖家{index:02d}-{seller_id[:8]}"
         charts.append(_create_chart(question, "bar_chart", seller_rows, "seller_negative_rate"))
+    if route_rows:
+        route_rows = sorted(
+            route_rows,
+            key=lambda item: _to_float(item.get("delivery_diff")) or 0.0,
+            reverse=True,
+        )
+        charts.append(_create_chart(question, "bar_chart", route_rows, "route_delivery"))
 
     return charts if state_rows and seller_rows else []
 

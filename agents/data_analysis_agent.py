@@ -388,13 +388,18 @@ national_avg AS (
 delivery_outliers AS (
     SELECT 'state_delivery' AS result_type,
            s.customer_state,
+           NULL AS seller_state,
+           NULL AS route_type,
            NULL AS seller_id,
            s.avg_delivery_days,
            n.national_avg_delivery_days,
            s.avg_delivery_days - n.national_avg_delivery_days AS delivery_diff,
+           NULL AS total_orders,
            NULL AS review_count,
            NULL AS negative_reviews,
-           NULL AS negative_rate
+           NULL AS negative_rate,
+           NULL AS on_time_rate,
+           NULL AS delayed_orders
     FROM state_avg s
     CROSS JOIN national_avg n
     WHERE s.avg_delivery_days > n.national_avg_delivery_days
@@ -404,25 +409,80 @@ delivery_outliers AS (
 seller_reviews AS (
     SELECT 'seller_negative_rate' AS result_type,
            NULL AS customer_state,
+           s.seller_state,
+           NULL AS route_type,
            oi.seller_id,
            NULL AS avg_delivery_days,
            NULL AS national_avg_delivery_days,
            NULL AS delivery_diff,
+           NULL AS total_orders,
            COUNT(DISTINCT r.review_id) AS review_count,
            COUNT(DISTINCT CASE WHEN r.review_score <= 2 THEN r.review_id END) AS negative_reviews,
-           COUNT(DISTINCT CASE WHEN r.review_score <= 2 THEN r.review_id END) / COUNT(DISTINCT r.review_id) AS negative_rate
+           COUNT(DISTINCT CASE WHEN r.review_score <= 2 THEN r.review_id END) / COUNT(DISTINCT r.review_id) AS negative_rate,
+           NULL AS on_time_rate,
+           NULL AS delayed_orders
     FROM order_items oi
     JOIN order_reviews r ON oi.order_id = r.order_id
-    GROUP BY oi.seller_id
+    JOIN sellers s ON s.seller_id = oi.seller_id
+    GROUP BY oi.seller_id, s.seller_state
     HAVING review_count >= 10
     ORDER BY negative_rate DESC, negative_reviews DESC
+    LIMIT 10
+),
+order_reviews_by_order AS (
+    SELECT order_id,
+           AVG(review_score) AS avg_review_score
+    FROM order_reviews
+    GROUP BY order_id
+),
+route_base AS (
+    SELECT DISTINCT
+           o.order_id,
+           c.customer_state,
+           s.seller_state,
+           CASE WHEN c.customer_state = s.seller_state THEN 'same_state' ELSE 'cross_state' END AS route_type,
+           DATEDIFF(o.order_delivered_customer_date, o.order_purchase_timestamp) AS delivery_days,
+           CASE WHEN o.order_delivered_customer_date <= o.order_estimated_delivery_date THEN 1 ELSE 0 END AS on_time_flag,
+           CASE WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date THEN 1 ELSE 0 END AS delayed_flag,
+           rv.avg_review_score
+    FROM orders o
+    JOIN customers c ON c.customer_id = o.customer_id
+    JOIN order_items oi ON oi.order_id = o.order_id
+    JOIN sellers s ON s.seller_id = oi.seller_id
+    LEFT JOIN order_reviews_by_order rv ON rv.order_id = o.order_id
+    WHERE o.order_purchase_timestamp IS NOT NULL
+      AND o.order_delivered_customer_date IS NOT NULL
+      AND o.order_estimated_delivery_date IS NOT NULL
+),
+route_delivery AS (
+    SELECT 'route_delivery' AS result_type,
+           rb.customer_state,
+           rb.seller_state,
+           rb.route_type,
+           NULL AS seller_id,
+           AVG(rb.delivery_days) AS avg_delivery_days,
+           n.national_avg_delivery_days,
+           AVG(rb.delivery_days) - n.national_avg_delivery_days AS delivery_diff,
+           COUNT(*) AS total_orders,
+           NULL AS review_count,
+           SUM(CASE WHEN rb.avg_review_score <= 2 THEN 1 ELSE 0 END) AS negative_reviews,
+           SUM(CASE WHEN rb.avg_review_score <= 2 THEN 1 ELSE 0 END) / COUNT(*) AS negative_rate,
+           AVG(rb.on_time_flag) AS on_time_rate,
+           SUM(rb.delayed_flag) AS delayed_orders
+    FROM route_base rb
+    CROSS JOIN national_avg n
+    GROUP BY rb.customer_state, rb.seller_state, rb.route_type, n.national_avg_delivery_days
+    HAVING total_orders >= 20
+    ORDER BY delivery_diff DESC, delayed_orders DESC
     LIMIT 10
 )
 SELECT * FROM delivery_outliers
 UNION ALL
 SELECT * FROM seller_reviews
+UNION ALL
+SELECT * FROM route_delivery
 """.strip()
-        summary_intent = "同时查询配送时长高于全国均值的州和差评率最高的卖家。"
+        summary_intent = "同时查询配送时长高于全国均值的州、差评率最高的卖家，以及客户州-卖家州路线的配送时长关系。"
 
     elif required_views == ["mv_delivery_perf"]:
         sql = """
@@ -617,6 +677,17 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
         print("==========================================")
         return deterministic_plan
 
+    required_views = required_views_for_question(question)
+    deterministic_plan = deterministic_required_view_plan(question, required_views)
+    if deterministic_plan and (
+        set(required_views) == {"mv_monthly_sales", "mv_state_sales"}
+        or required_views in (["mv_payment_dist"], ["mv_monthly_sales"])
+    ):
+        print("=========数据分析Agent-使用必需视图稳定查询计划：============")
+        print(deterministic_plan)
+        print("==========================================")
+        return deterministic_plan
+
     if (
         "卖家" in q
         and "差评率" in q
@@ -625,7 +696,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
     ):
         deterministic_plan = deterministic_required_view_plan(
             question,
-            required_views_for_question(question),
+            required_views,
         )
         if deterministic_plan:
             print("=========数据分析Agent-使用混合诊断稳定查询计划：============")
@@ -744,7 +815,6 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
             raise ValueError(f"生成的分布查询 SQL 语义不符合口径：{semantic_error}")
         raw = retry_raw
 
-    required_views = required_views_for_question(question)
     missing_views = [name for name in required_views if name not in detect_view_names(sql)]
     if missing_views:
         retry_error: str | None = None

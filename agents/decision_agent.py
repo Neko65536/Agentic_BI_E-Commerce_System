@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
+
+from agents.llm_client import LLMClient, LLMClientError
 
 
 def _contains(text: str, keywords: list[str]) -> bool:
@@ -72,6 +75,151 @@ def _build_strategy_tiers(recommendations: list[dict[str, str]]) -> dict[str, li
             "将GMV、准时率、差评率、低分卖家数纳入固定经营周报。",
             "沉淀预聚合视图和Agent问答截图，用于期末报告和答辩演示。",
         ],
+    }
+
+
+def _compact_json(value: Any, limit: int = 7000) -> str:
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...[truncated]"
+
+
+def _build_llm_evidence(
+    payload: dict[str, Any],
+    visualization_result: dict[str, Any] | None,
+    forecast_result: dict[str, Any] | None,
+    nlp_result: dict[str, Any] | None,
+    what_if_result: dict[str, Any] | None,
+    draft_recommendations: list[dict[str, str]],
+) -> dict[str, Any]:
+    return {
+        "question": payload.get("question"),
+        "analysis_type": payload.get("analysis_type"),
+        "intent": payload.get("intent"),
+        "summary": payload.get("summary"),
+        "view_name": payload.get("view_name"),
+        "used_view": payload.get("used_view"),
+        "key_findings": payload.get("key_findings"),
+        "sql": payload.get("sql"),
+        "forecast_result": forecast_result,
+        "nlp_result": nlp_result,
+        "what_if_result": what_if_result,
+        "visualization_charts": (visualization_result or {}).get("charts"),
+        "draft_recommendations": draft_recommendations,
+    }
+
+
+def _normalize_llm_recommendations(raw: dict[str, Any]) -> list[dict[str, str]]:
+    items = raw.get("recommendations")
+    if not isinstance(items, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip()
+        if not action:
+            continue
+        priority = str(item.get("priority") or "P1").strip().upper()
+        if priority not in {"P0", "P1", "P2"}:
+            priority = "P1"
+        normalized.append({
+            "priority": priority,
+            "action": action,
+            "evidence": str(item.get("evidence") or ""),
+            "expected_impact": str(item.get("expected_impact") or item.get("impact") or ""),
+        })
+    return normalized[:6]
+
+
+def _normalize_strategy_tiers(
+    raw: dict[str, Any],
+    recommendations: list[dict[str, str]],
+) -> dict[str, list[str]]:
+    tiers = raw.get("strategy_tiers")
+    if not isinstance(tiers, dict):
+        return _build_strategy_tiers(recommendations)
+
+    normalized: dict[str, list[str]] = {}
+    for key in ("next_7_days", "next_30_days", "next_90_days"):
+        value = tiers.get(key)
+        if isinstance(value, list):
+            normalized[key] = [str(item) for item in value if str(item).strip()][:4]
+        elif isinstance(value, str) and value.strip():
+            normalized[key] = [value.strip()]
+        else:
+            normalized[key] = []
+
+    fallback = _build_strategy_tiers(recommendations)
+    for key, value in fallback.items():
+        if not normalized[key]:
+            normalized[key] = value
+    return normalized
+
+
+def _generate_llm_strategy(
+    payload: dict[str, Any],
+    visualization_result: dict[str, Any] | None,
+    forecast_result: dict[str, Any] | None,
+    nlp_result: dict[str, Any] | None,
+    what_if_result: dict[str, Any] | None,
+    draft_recommendations: list[dict[str, str]],
+) -> dict[str, Any]:
+    evidence = _build_llm_evidence(
+        payload,
+        visualization_result,
+        forecast_result,
+        nlp_result,
+        what_if_result,
+        draft_recommendations,
+    )
+
+    system_prompt = """
+你是Agentic BI系统中的规范性决策Agent。你的任务是基于已给出的SQL查询结果、预测结果、评论NLP结果和What-if结果，生成可执行的运营决策建议。
+
+要求：
+1.只能使用输入证据，不要编造不存在的指标或表。
+2.建议必须具体到运营动作，例如物流线路、卖家治理、品类质检、支付体验、库存/客服排班。
+3.如果输入包含forecast_result，需要把未来6周趋势转化为容量、库存或履约建议。
+4.如果输入包含nlp_result，需要把情感/主题结果融入差评原因和改进方案。
+5.如果输入包含what_if_result，需要解释模拟假设、预期提升和落地风险。
+6.输出必须是合法JSON，不要Markdown。
+
+JSON格式：
+{
+  "business_problem": "一句话概括业务问题",
+  "recommendations": [
+    {"priority": "P0/P1/P2", "action": "具体行动", "evidence": "数据证据", "expected_impact": "预期影响"}
+  ],
+  "strategy_tiers": {
+    "next_7_days": ["7天内动作"],
+    "next_30_days": ["30天内动作"],
+    "next_90_days": ["90天内动作"]
+  },
+  "what_if_answer": null,
+  "priority": "P0/P1/P2",
+  "expected_impact": "总体预期影响"
+}
+""".strip()
+    user_prompt = f"请基于以下证据生成规范性决策建议：\n{_compact_json(evidence)}"
+    raw = LLMClient().chat_json([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ])
+
+    recommendations = _normalize_llm_recommendations(raw)
+    if not recommendations:
+        raise LLMClientError("DecisionAgent LLM未返回有效recommendations")
+
+    return {
+        "business_problem": str(raw.get("business_problem") or payload.get("question") or payload.get("intent") or "平台经营分析"),
+        "recommendations": recommendations,
+        "strategy_tiers": _normalize_strategy_tiers(raw, recommendations),
+        "what_if_answer": raw.get("what_if_answer"),
+        "priority": str(raw.get("priority") or recommendations[0]["priority"]),
+        "expected_impact": str(raw.get("expected_impact") or recommendations[0]["expected_impact"]),
     }
 
 
@@ -194,15 +342,44 @@ def run_decision_agent(
             "evidence": f"当前负面评论占比={negative_rate}" if negative_rate is not None else evidence_base,
         }
 
+    llm_generated = False
+    llm_error = None
+    business_problem = question or intent or "平台经营分析"
+    strategy_tiers = _build_strategy_tiers(recommendations)
+    priority = recommendations[0]["priority"]
+    expected_impact = recommendations[0]["expected_impact"]
+
+    try:
+        llm_strategy = _generate_llm_strategy(
+            payload=payload,
+            visualization_result=visualization_result,
+            forecast_result=forecast_result,
+            nlp_result=nlp_result,
+            what_if_result=what_if_result,
+            draft_recommendations=recommendations,
+        )
+        recommendations = llm_strategy["recommendations"]
+        strategy_tiers = llm_strategy["strategy_tiers"]
+        business_problem = llm_strategy["business_problem"]
+        if llm_strategy.get("what_if_answer") is not None:
+            what_if_answer = llm_strategy.get("what_if_answer")
+        priority = llm_strategy["priority"]
+        expected_impact = llm_strategy["expected_impact"]
+        llm_generated = True
+    except Exception as exc:
+        llm_error = str(exc)
+
     return {
         "agent": "decision_agent",
-        "business_problem": question or intent or "平台经营分析",
+        "business_problem": business_problem,
         "analysis_type": analysis_type,
         "recommendations": recommendations,
-        "strategy_tiers": _build_strategy_tiers(recommendations),
+        "strategy_tiers": strategy_tiers,
         "what_if_answer": what_if_answer,
-        "priority": recommendations[0]["priority"],
-        "expected_impact": recommendations[0]["expected_impact"],
+        "priority": priority,
+        "expected_impact": expected_impact,
+        "llm_generated": llm_generated,
+        "llm_error": llm_error,
         "evidence": {
             "summary": summary,
             "view_name": view_name,

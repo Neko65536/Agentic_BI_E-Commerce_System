@@ -77,9 +77,26 @@ SYSTEM_PROMPT = """
 
 def _normalize_analysis_type(value: Any) -> AnalysisType:
     text = str(value or "descriptive").strip().lower()
-    if text not in ALLOWED_ANALYSIS_TYPES:
-        return "descriptive"
-    return text  # type: ignore[return-value]
+    if text in ALLOWED_ANALYSIS_TYPES:
+        return text  # type: ignore[return-value]
+
+    for candidate in ("prescriptive", "predictive", "diagnostic", "descriptive"):
+        if candidate in text:
+            return candidate  # type: ignore[return-value]
+
+    chinese_aliases: tuple[tuple[str, AnalysisType], ...] = (
+        ("规范", "prescriptive"),
+        ("决策", "prescriptive"),
+        ("预测", "predictive"),
+        ("诊断", "diagnostic"),
+        ("原因", "diagnostic"),
+        ("描述", "descriptive"),
+    )
+    for keyword, normalized in chinese_aliases:
+        if keyword in text:
+            return normalized
+
+    return "descriptive"
 
 
 def _normalize_task(question: str, raw_task: dict[str, Any]) -> AgentTask:

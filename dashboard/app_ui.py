@@ -226,6 +226,7 @@ def display_bar_chart(result: dict, chart: dict = None):
                     "product_category_english",
                     "payment_type",
                     "customer_state",
+                    "route_label",
                     "seller_label",
                     "seller_id",
                 ]
