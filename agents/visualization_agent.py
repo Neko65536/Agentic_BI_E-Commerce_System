@@ -42,6 +42,12 @@ def _ensure_output_dir() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _is_what_if_question(question: str) -> bool:
+    q = re.sub(r"\s+", "", question.lower())
+    triggers = ("what-if", "whatif", "如果", "假如", "下架", "整改", "提升多少", "模拟")
+    return any(token in q for token in triggers)
+
+
 def _to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -85,8 +91,37 @@ def _label_fields(rows: list[dict[str, Any]]) -> list[str]:
     return [key for key in rows[0] if key not in numeric]
 
 
+def _rate_metric_keys(keys: set[str]) -> set[str]:
+    return keys & {
+        "cancellation_rate", "return_rate", "cancel_rate",
+        "negative_rate", "on_time_rate", "refund_rate",
+    }
+
+
+def _aggregate_rows_by_state(
+    rows: list[dict[str, Any]],
+    state_key: str,
+    metric_key: str,
+) -> list[dict[str, Any]]:
+    """Sum duplicate state rows for count-like geo metrics."""
+    aggregated: dict[str, float] = {}
+    passthrough: dict[str, Any] = {}
+    for row in rows:
+        state = str(row.get(state_key, "")).upper()
+        if not state:
+            continue
+        value = _to_float(row.get(metric_key)) or 0.0
+        aggregated[state] = aggregated.get(state, 0.0) + value
+        passthrough[state] = {k: v for k, v in row.items() if k not in {state_key, metric_key}}
+    return [
+        {state_key: state, metric_key: value, **passthrough.get(state, {})}
+        for state, value in aggregated.items()
+    ]
+
+
 def _pick_metric(rows: list[dict[str, Any]]) -> str | None:
     preferred = [
+        "cancellation_rate", "return_rate", "cancel_rate", "refund_rate",
         "total_gmv", "gmv_total", "total_orders", "total_transactions", "total_value",
         "avg_basket", "delivery_diff", "avg_delivery_days", "on_time_rate", "delayed_orders",
         "avg_review_score", "avg_rating", "negative_rate",
@@ -209,7 +244,8 @@ def _svg_line(rows: list[dict[str, Any]], label_key: str, metric_key: str) -> st
 
 
 def _svg_geo_bubble(rows: list[dict[str, Any]], state_key: str, metric_key: str) -> str:
-    data = [row for row in rows if str(row.get(state_key, "")).upper() in STATE_COORDS][:27]
+    deduped = _aggregate_rows_by_state(rows, state_key, metric_key)
+    data = [row for row in deduped if str(row.get(state_key, "")).upper() in STATE_COORDS][:27]
     if not data:
         return _html_table(rows)
 
@@ -379,13 +415,19 @@ def _write_html(title: str, body: str, metadata: dict[str, Any]) -> Path:
     return path
 
 
-def _infer_chart_type(recommended: str | None, rows: list[dict[str, Any]]) -> str:
+def _infer_chart_type(
+    recommended: str | None,
+    rows: list[dict[str, Any]],
+    question: str = "",
+) -> str:
     if not rows:
         return "table"
     if len(rows) == 1 and _numeric_fields(rows):
         return "big_number_card"
 
     keys = set(rows[0])
+    if _rate_metric_keys(keys) and ("customer_state" in keys or "seller_state" in keys):
+        return "bar_chart"
     if "customer_state" in keys or "seller_state" in keys:
         return "geographic_bubble_map"
     if {"product_weight_g", "freight_value"}.issubset(keys) or {"product_weight_g", "price"}.issubset(keys):
@@ -397,7 +439,10 @@ def _infer_chart_type(recommended: str | None, rows: list[dict[str, Any]]) -> st
     labels = _label_fields(rows)
     label_key = _pick_label(rows) or ""
     if recommended in {"line_chart", "bar_chart", "table", "big_number_card"}:
-        return recommended
+        if recommended == "table_with_highlights":
+            recommended = "bar_chart" if labels and numeric else "table"
+        if recommended in {"line_chart", "bar_chart", "table", "big_number_card"}:
+            return recommended
     if len(labels) >= 2 and numeric:
         return "matrix_heatmap"
     if "month" in label_key or "date" in label_key or "week" in label_key:
@@ -622,22 +667,31 @@ def run_visualization_agent(payload: dict[str, Any]) -> dict[str, Any]:
         rows = []
 
     question = str(payload.get("question") or "BI分析结果")
-    charts = _delivery_seller_split_charts(question, rows)
-    if not charts:
-        primary_type = _infer_chart_type(payload.get("recommended_chart"), rows)
-        charts = [_create_chart(question, primary_type, rows, "primary")]
-
-    forecast_rows = _forecast_rows(payload)
-    if forecast_rows:
-        charts.append(_create_chart(question, "line_chart", forecast_rows, "forecast"))
-
     what_if_rows = _what_if_rows(payload)
-    if what_if_rows:
-        charts.append(_create_chart(question, "bar_chart", what_if_rows, "what_if"))
+    dedicated_what_if = bool(what_if_rows) and _is_what_if_question(question)
 
-    keyword_rows = _keyword_rows(payload)
-    if keyword_rows:
-        charts.append(_create_word_cloud(question, keyword_rows))
+    if dedicated_what_if:
+        charts = [_create_chart(question, "bar_chart", what_if_rows, "what_if")]
+    else:
+        charts = _delivery_seller_split_charts(question, rows)
+        if not charts:
+            primary_type = _infer_chart_type(
+                payload.get("recommended_chart"),
+                rows,
+                question,
+            )
+            charts = [_create_chart(question, primary_type, rows, "primary")]
+
+        forecast_rows = _forecast_rows(payload)
+        if forecast_rows:
+            charts.append(_create_chart(question, "line_chart", forecast_rows, "forecast"))
+
+        if what_if_rows:
+            charts.append(_create_chart(question, "bar_chart", what_if_rows, "what_if"))
+
+        keyword_rows = _keyword_rows(payload)
+        if keyword_rows:
+            charts.append(_create_word_cloud(question, keyword_rows))
 
     primary = charts[0]
     return {

@@ -170,12 +170,30 @@ def visualization_node(state: BIAnalysisState) -> BIAnalysisState:
         return {"visualization_result": None, "errors": errors}
 
 
-def _needs_forecast(state: BIAnalysisState) -> bool:
+WHAT_IF_TRIGGERS = (
+    "what-if", "what if", "whatif", "如果", "假如", "下架", "整改", "提升多少", "模拟",
+)
+
+
+def _combined_question_text(state: BIAnalysisState) -> str:
     plan = state["coordinator_plan"]
-    question = state["question"]
-    text = f"{question} {plan['intent']} {plan['analysis_type']}".lower()
+    return f"{state['question']} {plan.get('intent', '')} {plan.get('analysis_type', '')}"
+
+
+def _is_what_if_question(state: BIAnalysisState) -> bool:
+    text = _combined_question_text(state).lower()
+    return any(keyword in text for keyword in WHAT_IF_TRIGGERS)
+
+
+def _needs_forecast(state: BIAnalysisState) -> bool:
+    if _is_what_if_question(state):
+        return False
+    plan = state["coordinator_plan"]
+    text = _combined_question_text(state).lower()
     keywords = ["预测", "未来", "forecast", "predict", "next"]
-    return plan["analysis_type"] == "predictive" or any(keyword in text for keyword in keywords)
+    if plan["analysis_type"] == "predictive":
+        return True
+    return any(keyword in text for keyword in keywords)
 
 
 def forecast_node(state: BIAnalysisState) -> BIAnalysisState:
@@ -196,9 +214,10 @@ def forecast_node(state: BIAnalysisState) -> BIAnalysisState:
 
 
 def _needs_nlp(state: BIAnalysisState) -> bool:
+    if _is_what_if_question(state):
+        return False
     plan = state["coordinator_plan"]
-    question = state["question"]
-    text = f"{question} {plan['intent']} {plan['analysis_type']}".lower()
+    text = _combined_question_text(state).lower()
     keywords = ["评论", "评价", "评分", "差评", "好评", "review", "sentiment", "seller", "卖家"]
     return plan["analysis_type"] in {"diagnostic", "prescriptive"} or any(keyword in text for keyword in keywords)
 
@@ -217,11 +236,7 @@ def nlp_review_node(state: BIAnalysisState) -> BIAnalysisState:
 
 
 def _needs_what_if(state: BIAnalysisState) -> bool:
-    plan = state["coordinator_plan"]
-    question = state["question"]
-    text = f"{question} {plan['intent']} {plan['analysis_type']}".lower()
-    keywords = ["what-if", "what if", "如果", "假如", "下架", "整改", "提升多少", "模拟"]
-    return any(keyword in text for keyword in keywords)
+    return _is_what_if_question(state)
 
 
 def what_if_node(state: BIAnalysisState) -> BIAnalysisState:
@@ -320,10 +335,12 @@ def final_answer_node(state: BIAnalysisState) -> BIAnalysisState:
     what_if_text = ""
     if what_if_result:
         what_if_text = (
-            f"\n\nWhat-if模拟：\n"
+            f"\n\nWhat-if模拟结论：\n"
             f"{what_if_result.get('insight')}\n"
-            f"受影响评论数：{what_if_result.get('affected_reviews')}，"
-            f"预估评分提升：{what_if_result.get('estimated_lift')}"
+            f"干预前均分：{what_if_result.get('baseline_avg_score')} → "
+            f"干预后均分：{what_if_result.get('simulated_avg_score')}（"
+            f"提升 {what_if_result.get('estimated_lift')} 分）\n"
+            f"受影响评论数：{what_if_result.get('affected_reviews')}"
         )
 
     final_answer = f"""

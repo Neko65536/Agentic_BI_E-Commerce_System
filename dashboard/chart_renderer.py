@@ -150,7 +150,8 @@ class ChartRenderer:
         }
         
         bubble_data = []
-        for _, row in df.iterrows():
+        grouped = df.groupby(state_col, as_index=False)[numeric_cols[0]].sum()
+        for _, row in grouped.iterrows():
             state = str(row[state_col]).upper()
             if state in state_coords:
                 lng, lat = state_coords[state]

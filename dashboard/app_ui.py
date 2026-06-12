@@ -41,6 +41,7 @@ def init_session_state():
             "summary": True,
             "sql": True,
             "visualization": True,
+            "what_if": True,
             "nlp": True,
             "forecast": True,
             "decision": True
@@ -229,6 +230,9 @@ def display_bar_chart(result: dict, chart: dict = None):
                     "seller_id",
                 ]
                 preferred_metrics = [
+                    "cancellation_rate",
+                    "return_rate",
+                    "cancel_rate",
                     "delivery_diff",
                     "negative_rate",
                     "avg_delivery_days",
@@ -267,10 +271,20 @@ def display_bar_chart(result: dict, chart: dict = None):
 
                 if not df.empty:
                     df = df.sort_values(metric_col, ascending=False).head(20)
-                    fig = px.bar(df, x=x_col, y=y_cols,
-                                 title=chart.get("chart_title", "数据对比"),
-                                 labels={x_col: x_col},
-                                 template="plotly_white")
+                    y_label = metric_col
+                    if metric_col.endswith("_rate"):
+                        df = df.copy()
+                        df["_plot_rate"] = df[metric_col] * 100
+                        y_cols = ["_plot_rate"]
+                        y_label = f"{metric_col} (%)"
+                    fig = px.bar(
+                        df,
+                        x=x_col,
+                        y=y_cols,
+                        title=chart.get("chart_title", "数据对比"),
+                        labels={x_col: x_col, "_plot_rate": y_label},
+                        template="plotly_white",
+                    )
                     fig.update_layout(height=350)
                     st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
@@ -282,35 +296,67 @@ def display_geo_chart(result: dict, chart: dict = None):
     try:
         import pandas as pd
         import plotly.express as px
-        
+
         data = get_chart_rows(result, chart)
-        
+
         if data:
             df = pd.DataFrame(data)
-            
+
             state_col = None
             for col in ["customer_state", "seller_state", "geolocation_state", "state"]:
                 if col in df.columns:
                     state_col = col
                     break
-            
+
             if state_col:
+                chart_metric = chart.get("metric_key") if chart else None
                 numeric_cols = [col for col in df.columns if df[col].dtype in ["int64", "float64"]]
-                
-                if numeric_cols:
-                    fig = px.scatter(df, 
-                                     x=numeric_cols[0], 
-                                     y=numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0],
-                                     size=numeric_cols[0],
-                                     color=state_col,
-                                     title=chart.get("chart_title", "地理分布"),
-                                     labels={state_col: "州"},
-                                     template="plotly_white")
-                    fig.update_layout(height=350)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.markdown("📍 **巴西各州数据分布**")
-                    st.dataframe(df[[state_col] + numeric_cols[:3]])
+                rate_cols = [col for col in numeric_cols if col.endswith("_rate")]
+                metric_col = chart_metric if chart_metric in df.columns else (
+                    rate_cols[0] if rate_cols else numeric_cols[0] if numeric_cols else None
+                )
+
+                if metric_col:
+                    state_coords = {
+                        "AC": (-70.0, -9.0), "AL": (-36.6, -9.6), "AM": (-63.0, -4.5),
+                        "AP": (-51.8, 1.4), "BA": (-41.7, -12.6), "CE": (-39.6, -5.2),
+                        "DF": (-47.9, -15.8), "ES": (-40.3, -19.6), "GO": (-49.8, -16.0),
+                        "MA": (-45.0, -5.0), "MG": (-44.5, -18.5), "MS": (-54.5, -20.5),
+                        "MT": (-56.0, -13.0), "PA": (-52.0, -3.8), "PB": (-36.8, -7.1),
+                        "PE": (-37.8, -8.4), "PI": (-42.8, -7.5), "PR": (-51.5, -24.7),
+                        "RJ": (-43.2, -22.3), "RN": (-36.5, -5.8), "RO": (-63.0, -11.0),
+                        "RR": (-61.4, 2.0), "RS": (-53.2, -30.0), "SC": (-50.0, -27.2),
+                        "SE": (-37.4, -10.6), "SP": (-48.0, -22.2), "TO": (-48.3, -10.2),
+                    }
+
+                    grouped = (
+                        df.groupby(state_col, as_index=False)[metric_col]
+                        .sum()
+                        .rename(columns={metric_col: "metric_value"})
+                    )
+                    grouped["state"] = grouped[state_col].astype(str).str.upper()
+                    grouped = grouped[grouped["state"].isin(state_coords)]
+                    grouped["longitude"] = grouped["state"].map(lambda s: state_coords[s][0])
+                    grouped["latitude"] = grouped["state"].map(lambda s: state_coords[s][1])
+
+                    if not grouped.empty:
+                        fig = px.scatter(
+                            grouped,
+                            x="longitude",
+                            y="latitude",
+                            size="metric_value",
+                            color="state",
+                            hover_name="state",
+                            hover_data={"metric_value": True, "longitude": False, "latitude": False},
+                            title=chart.get("chart_title", "巴西各州地理分布"),
+                            labels={"metric_value": metric_col},
+                            template="plotly_white",
+                        )
+                        fig.update_layout(height=350, xaxis_title="经度", yaxis_title="纬度")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("📍 **巴西各州数据分布**")
+                        st.dataframe(grouped[[state_col, "metric_value"]])
     except Exception as e:
         st.warning(f"地理图表渲染失败: {str(e)}")
 
@@ -473,6 +519,8 @@ def display_data_table(result: dict, chart: dict = None):
 
 def display_nlp_result(result: dict):
     """Display NLP analysis results with collapsible section."""
+    if result.get("what_if_result"):
+        return
     nlp_result = result.get("nlp_result")
     if nlp_result:
         with st.expander("💬 NLP分析结果", expanded=st.session_state.expanded_sections.get("nlp", True)):
@@ -506,6 +554,8 @@ def display_nlp_result(result: dict):
 
 def display_forecast_result(result: dict):
     """Display forecast results with collapsible section."""
+    if result.get("what_if_result"):
+        return
     forecast_result = result.get("forecast_result")
     if forecast_result:
         with st.expander("📈 预测结果", expanded=st.session_state.expanded_sections.get("forecast", True)):
@@ -539,6 +589,63 @@ def display_forecast_result(result: dict):
                 st.markdown(f"**置信区间:** {forecast_result['confidence_interval']}")
 
 
+def display_what_if_result(result: dict):
+    """Display What-if simulation results."""
+    what_if = result.get("what_if_result")
+    if not what_if:
+        return
+
+    with st.expander("🔮 What-if 模拟", expanded=st.session_state.expanded_sections.get("what_if", True)):
+        st.markdown(f"**场景:** {what_if.get('scenario', '卖家干预模拟')}")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("干预前均分", what_if.get("baseline_avg_score"))
+        col2.metric("干预后均分", what_if.get("simulated_avg_score"))
+        col3.metric("预估提升", what_if.get("estimated_lift"))
+
+        if what_if.get("insight"):
+            st.markdown(f"**结论:** {what_if.get('insight')}")
+
+        st.markdown(
+            f"受影响评论 **{what_if.get('affected_reviews')}** 条 · "
+            f"剩余评论 **{what_if.get('remaining_reviews')}** 条 · "
+            f"被干预卖家均分 **{what_if.get('affected_avg_score')}**"
+        )
+
+        chart_data = what_if.get("chart_data") or []
+        if chart_data:
+            try:
+                import pandas as pd
+                import plotly.express as px
+
+                df = pd.DataFrame(chart_data)
+                label_map = {
+                    "baseline": "干预前",
+                    "after_intervention": "干预后",
+                    "affected_sellers": "被干预卖家",
+                }
+                if "scenario" in df.columns:
+                    df["scenario_label"] = df["scenario"].map(label_map).fillna(df["scenario"])
+                    fig = px.bar(
+                        df,
+                        x="scenario_label",
+                        y="avg_review_score",
+                        title="平台评分干预前后对比",
+                        labels={"scenario_label": "场景", "avg_review_score": "平均评分"},
+                        template="plotly_white",
+                    )
+                    fig.update_layout(height=320)
+                    st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.dataframe(chart_data)
+
+        assumptions = what_if.get("assumptions") or []
+        if assumptions:
+            st.markdown("**假设说明:**")
+            for item in assumptions:
+                st.write(f"- {item}")
+
+
 def display_decision_result(result: dict):
     """Display decision/recommendation results with collapsible section."""
     decision_result = result.get("decision_result")
@@ -551,14 +658,29 @@ def display_decision_result(result: dict):
                 st.markdown("**运营建议:**")
                 for i, rec in enumerate(decision_result["recommendations"][:5], 1):
                     if isinstance(rec, dict):
-                        suggestion = rec.get("suggestion", rec.get("recommendation", str(rec)))
+                        action = rec.get("action") or rec.get("suggestion") or rec.get("recommendation", str(rec))
                         priority = rec.get("priority", "")
+                        evidence = rec.get("evidence", "")
+                        impact = rec.get("expected_impact", "")
                         if priority:
-                            st.write(f"{i}. **{suggestion}** (优先级: {priority})")
+                            st.write(f"{i}. **{action}** (优先级: {priority})")
                         else:
-                            st.write(f"{i}. {suggestion}")
+                            st.write(f"{i}. {action}")
+                        if evidence:
+                            st.caption(f"依据: {evidence}")
+                        if impact:
+                            st.caption(f"预期影响: {impact}")
                     else:
                         st.write(f"{i}. {rec}")
+
+            what_if_answer = decision_result.get("what_if_answer")
+            if what_if_answer and what_if_answer.get("estimated_lift") is not None:
+                st.markdown("**What-if 量化答案:**")
+                st.write(
+                    f"评分 {what_if_answer.get('baseline_avg_score')} → "
+                    f"{what_if_answer.get('simulated_avg_score')} "
+                    f"(+{what_if_answer.get('estimated_lift')})"
+                )
             
             if "priority" in decision_result:
                 st.markdown(f"**整体优先级:** {decision_result['priority']}")
@@ -1136,6 +1258,9 @@ def main():
             # Visualization
             with st.expander("🎨 可视化图表", expanded=st.session_state.expanded_sections.get("visualization", True)):
                 display_visualization(result)
+
+            # What-if result
+            display_what_if_result(result)
             
             # NLP result
             display_nlp_result(result)

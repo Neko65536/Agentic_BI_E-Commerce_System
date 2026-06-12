@@ -89,68 +89,82 @@ def run_decision_agent(
     analysis_type = str(payload.get("analysis_type") or "")
     evidence_base = summary or "基于数据分析Agent返回的查询结果。"
 
+    is_what_if_q = bool(what_if_result) or _contains(
+        question + intent,
+        ["what-if", "whatif", "如果", "假如", "下架", "整改", "提升多少", "模拟"],
+    )
+
     recommendations: list[dict[str, str]] = []
-
-    if view_name == "mv_delivery_perf" or _contains(question + intent, ["配送", "延迟", "准时", "delivery"]):
-        recommendations.append(_recommendation(
-            "P0",
-            "优先治理延迟订单集中的州，拆分为干线运输、末端派送和承诺时效三类问题分别跟踪。",
-            evidence_base,
-            "提升准时率，降低差评和退款风险。",
-        ))
-
-    if view_name == "mv_seller_perf" or _contains(question + intent, ["卖家", "差评", "评分", "review"]):
-        recommendations.append(_recommendation(
-            "P0",
-            "建立低评分卖家观察名单，对连续低分且订单量较高的卖家触发整改或流量降权。",
-            evidence_base,
-            "减少高风险卖家对整体口碑的拖累。",
-        ))
-
-    if view_name == "mv_category_sales" or _contains(question + intent, ["品类", "category"]):
-        recommendations.append(_recommendation(
-            "P1",
-            "对高GMV品类做库存和物流优先保障，对下滑品类检查价格、评价和配送体验。",
-            evidence_base,
-            "稳定核心收入，同时识别品类增长机会。",
-        ))
-
-    if view_name == "mv_payment_dist" or _contains(question + intent, ["支付", "分期", "payment"]):
-        recommendations.append(_recommendation(
-            "P1",
-            "围绕主流支付方式优化结算体验，并监控高分期订单的坏账或取消风险。",
-            evidence_base,
-            "提升支付转化率和资金周转稳定性。",
-        ))
-
-    if forecast_result and forecast_result.get("forecast_values"):
-        recommendations.append(_recommendation(
-            "P1",
-            "根据未来6周GMV预测提前调整客服、仓储和物流容量。",
-            str(forecast_result.get("trend_summary", "")),
-            "降低销售波动期间的履约压力。",
-        ))
-
-    if nlp_result and nlp_result.get("negative_rate") is not None:
-        recommendations.append(_recommendation(
-            "P1",
-            "将差评关键词纳入运营周报，针对高频问题制定卖家培训和物流整改清单。",
-            str(nlp_result.get("insight", "")),
-            "把非结构化评论转化为可追踪的服务质量指标。",
-        ))
-        for topic in (nlp_result.get("topic_summary") or [])[:3]:
-            topic_item = _topic_recommendation(topic)
-            if topic_item:
-                recommendations.append(topic_item)
 
     if what_if_result:
         lift = what_if_result.get("estimated_lift")
+        baseline = what_if_result.get("baseline_avg_score")
+        simulated = what_if_result.get("simulated_avg_score")
         recommendations.append(_recommendation(
             "P0",
-            "优先对What-if模拟识别出的Top高差评卖家执行整改、流量限制或临时下架，并跟踪整改前后评分变化。",
+            f"优先整改或下架Top高差评卖家：平台均分预计从{baseline}提升至{simulated}（+{lift}分）。",
             str(what_if_result.get("insight", "")),
-            f"模拟显示平台平均评分预计提升{lift}分，适合作为高优先级运营实验。",
+            f"受影响评论{what_if_result.get('affected_reviews')}条，适合作为高优先级运营实验。",
         ))
+        recommendations.append(_recommendation(
+            "P1",
+            "对模拟识别出的高差评卖家分批整改，并跟踪整改前后评分与差评率变化。",
+            f"被干预卖家评论均分{what_if_result.get('affected_avg_score')}，明显低于平台均值。",
+            "验证模拟结论，并控制GMV与供给替代风险。",
+        ))
+
+    if not is_what_if_q:
+        if view_name == "mv_delivery_perf" or _contains(question + intent, ["配送", "延迟", "准时", "delivery"]):
+            recommendations.append(_recommendation(
+                "P0",
+                "优先治理延迟订单集中的州，拆分为干线运输、末端派送和承诺时效三类问题分别跟踪。",
+                evidence_base,
+                "提升准时率，降低差评和退款风险。",
+            ))
+
+        if view_name == "mv_seller_perf" or _contains(question + intent, ["卖家", "差评", "评分", "review"]):
+            recommendations.append(_recommendation(
+                "P0",
+                "建立低评分卖家观察名单，对连续低分且订单量较高的卖家触发整改或流量降权。",
+                evidence_base,
+                "减少高风险卖家对整体口碑的拖累。",
+            ))
+
+        if view_name == "mv_category_sales" or _contains(question + intent, ["品类", "category"]):
+            recommendations.append(_recommendation(
+                "P1",
+                "对高GMV品类做库存和物流优先保障，对下滑品类检查价格、评价和配送体验。",
+                evidence_base,
+                "稳定核心收入，同时识别品类增长机会。",
+            ))
+
+        if view_name == "mv_payment_dist" or _contains(question + intent, ["支付", "分期", "payment"]):
+            recommendations.append(_recommendation(
+                "P1",
+                "围绕主流支付方式优化结算体验，并监控高分期订单的坏账或取消风险。",
+                evidence_base,
+                "提升支付转化率和资金周转稳定性。",
+            ))
+
+        if forecast_result and forecast_result.get("forecast_values"):
+            recommendations.append(_recommendation(
+                "P1",
+                "根据未来6周GMV预测提前调整客服、仓储和物流容量。",
+                str(forecast_result.get("trend_summary", "")),
+                "降低销售波动期间的履约压力。",
+            ))
+
+        if nlp_result and nlp_result.get("negative_rate") is not None:
+            recommendations.append(_recommendation(
+                "P1",
+                "将差评关键词纳入运营周报，针对高频问题制定卖家培训和物流整改清单。",
+                str(nlp_result.get("insight", "")),
+                "把非结构化评论转化为可追踪的服务质量指标。",
+            ))
+            for topic in (nlp_result.get("topic_summary") or [])[:3]:
+                topic_item = _topic_recommendation(topic)
+                if topic_item:
+                    recommendations.append(topic_item)
 
     if not recommendations:
         recommendations.append(_recommendation(

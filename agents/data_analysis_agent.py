@@ -38,6 +38,9 @@ if str(ROOT) not in sys.path:
 
 from agents.llm_client import LLMClient
 from agents.schemas import AgentTask, DataAnalysisResult
+
+NORTHEAST_STATES = ("AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE")
+NORTHEAST_STATE_SQL = ", ".join(f"'{code}'" for code in NORTHEAST_STATES)
 from agents.sql_guard import validate_readonly_sql
 from config.settings import sqlalchemy_url
 
@@ -167,6 +170,108 @@ def build_sql_plan_from_raw(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_question(question: str) -> str:
     return re.sub(r"\s+", "", question.lower())
+
+
+def is_northeast_cancellation_question(question: str) -> bool:
+    """Detect prescriptive/diagnostic questions about Northeast Brazil return/cancel rates."""
+    q = _normalize_question(question)
+    has_region = any(token in q for token in ["东北部", "东北", "northeast"])
+    has_return = any(token in q for token in ["退货", "取消", "return", "cancel", "cancellation"])
+    if has_region and has_return:
+        return True
+    if has_region and any(token in q for token in ["降低", "改进", "运营", "方案"]):
+        return True
+    return False
+
+
+def is_what_if_seller_question(question: str) -> bool:
+    q = _normalize_question(question)
+    triggers = ("what-if", "whatif", "如果", "假如", "下架", "整改", "提升多少", "模拟")
+    if not any(token in q for token in triggers):
+        return False
+    return any(token in q for token in ("卖家", "差评", "评分", "seller", "review", "top", "高差评"))
+
+
+def deterministic_what_if_context_plan(question: str) -> dict[str, Any]:
+    """Stable context query for What-if seller intervention questions."""
+    sql = """
+WITH seller_review AS (
+    SELECT oi.seller_id,
+           COUNT(DISTINCT r.review_id) AS review_count,
+           AVG(r.review_score) AS avg_review_score,
+           SUM(CASE WHEN r.review_score <= 2 THEN 1 ELSE 0 END) AS negative_reviews
+    FROM order_items oi
+    JOIN order_reviews r ON r.order_id = oi.order_id
+    GROUP BY oi.seller_id
+    HAVING review_count >= 5
+),
+top_sellers AS (
+    SELECT seller_id, review_count, avg_review_score, negative_reviews
+    FROM seller_review
+    ORDER BY negative_reviews DESC, avg_review_score ASC
+    LIMIT 20
+),
+top_agg AS (
+    SELECT SUM(review_count) AS top20_reviews,
+           AVG(avg_review_score) AS top20_avg_score
+    FROM top_sellers
+)
+SELECT b.platform_total_reviews,
+       ROUND(b.platform_avg_score, 4) AS platform_avg_score,
+       t.top20_reviews,
+       ROUND(t.top20_avg_score, 4) AS top20_avg_score
+FROM (
+    SELECT COUNT(*) AS platform_total_reviews,
+           AVG(review_score) AS platform_avg_score
+    FROM order_reviews
+) b
+CROSS JOIN top_agg t
+""".strip()
+    return build_sql_plan_from_raw({
+        "sql": sql,
+        "used_view": False,
+        "view_name": None,
+        "summary_intent": "汇总平台与Top20高差评卖家评论均分，供What-if模拟对照。",
+    })
+
+
+def deterministic_northeast_cancellation_plan(question: str) -> dict[str, Any]:
+    """
+    Stable SQL for Northeast Brazil cancellation-rate analysis.
+
+    Olist has no explicit return table; canceled orders are used as the proxy metric.
+    """
+    sql = f"""
+WITH state_orders AS (
+    SELECT c.customer_state,
+           COUNT(DISTINCT o.order_id) AS total_orders,
+           SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) AS canceled_orders
+    FROM orders o
+    JOIN customers c ON c.customer_id = o.customer_id
+    WHERE o.order_purchase_timestamp IS NOT NULL
+    GROUP BY c.customer_state
+),
+national AS (
+    SELECT ROUND(SUM(canceled_orders) / NULLIF(SUM(total_orders), 0), 4) AS national_cancellation_rate
+    FROM state_orders
+)
+SELECT s.customer_state,
+       'Northeast' AS region,
+       s.total_orders,
+       s.canceled_orders,
+       ROUND(s.canceled_orders / NULLIF(s.total_orders, 0), 4) AS cancellation_rate,
+       n.national_cancellation_rate
+FROM state_orders s
+CROSS JOIN national n
+WHERE s.customer_state IN ({NORTHEAST_STATE_SQL})
+ORDER BY cancellation_rate DESC
+""".strip()
+    return build_sql_plan_from_raw({
+        "sql": sql,
+        "used_view": False,
+        "view_name": None,
+        "summary_intent": "统计巴西东北部9州订单取消率（作为退货代理指标），并与全国取消率对比。",
+    })
 
 
 def required_views_for_question(question: str) -> list[str]:
@@ -397,6 +502,13 @@ def required_sql_signals_for_question(question: str) -> list[tuple[str, str]]:
             ("seller_id", "结果必须包含卖家ID维度。"),
             ("negative_rate", "结果必须显式计算差评率negative_rate。"),
         ])
+
+    if is_northeast_cancellation_question(question):
+        signals.extend([
+            ("cancellation_rate", "东北部退货/取消问题必须显式计算cancellation_rate。"),
+            ("customer_state", "结果必须包含customer_state州维度。"),
+            (NORTHEAST_STATES[0], "结果必须限定巴西东北部州。"),
+        ])
     return signals
 
 
@@ -491,6 +603,20 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
     Ask the DataAnalysisAgent LLM to produce SQL and metadata.
     """
     q = _normalize_question(question)
+    if is_what_if_seller_question(question):
+        deterministic_plan = deterministic_what_if_context_plan(question)
+        print("=========数据分析Agent-使用What-if上下文稳定查询计划：============")
+        print(deterministic_plan)
+        print("==========================================")
+        return deterministic_plan
+
+    if is_northeast_cancellation_question(question):
+        deterministic_plan = deterministic_northeast_cancellation_plan(question)
+        print("=========数据分析Agent-使用东北部取消率稳定查询计划：============")
+        print(deterministic_plan)
+        print("==========================================")
+        return deterministic_plan
+
     if (
         "卖家" in q
         and "差评率" in q
@@ -533,6 +659,7 @@ def generate_sql_plan(question: str, task: AgentTask) -> dict[str, Any]:
 17. 当问题询问“卖家差评率最高”时，必须查询 order_reviews、order_items、sellers，按 seller_id 计算 review_count、negative_reviews、negative_rate，并按 negative_rate 降序返回高差评率卖家。
 18. 当问题同时询问州配送时长高于全国均值和高差评率卖家时，允许用 UNION ALL 或 JSON 字段在同一条SQL中同时返回州级配送异常和卖家差评率结果。
 19. 当问题询问综合改进策略或多维诊断时，优先组合销售、配送、支付、评论/品类或卖家相关数据，返回足够的决策依据。
+20. 当问题询问巴西东北部退货率/取消率及运营改进方案时，查询 orders + customers，限定东北部9州（AL,BA,CE,MA,PB,PE,PI,RN,SE），按 customer_state 计算 total_orders、canceled_orders、cancellation_rate，并按 cancellation_rate 降序返回。
 
 数据字典：
 {data_dictionary}
@@ -791,6 +918,30 @@ def summarize_rows(
     if not rows:
         return "没有查询到符合条件的数据。"
 
+    q = _normalize_question(question)
+    if is_what_if_seller_question(question) and rows and "platform_avg_score" in rows[0]:
+        row = rows[0]
+        return (
+            f"平台评论 {row.get('platform_total_reviews')} 条，均分 {row.get('platform_avg_score')}；"
+            f"Top20 高差评卖家评论 {row.get('top20_reviews')} 条，均分 {row.get('top20_avg_score')}。"
+            f"评分提升幅度由 What-if Agent 模拟计算。"
+        )
+
+    if is_northeast_cancellation_question(question) and "cancellation_rate" in rows[0]:
+        top_row = max(
+            rows,
+            key=lambda row: float(row.get("cancellation_rate") or 0),
+        )
+        top_state = top_row.get("customer_state")
+        top_rate = float(top_row.get("cancellation_rate") or 0)
+        national_rate = float(rows[0].get("national_cancellation_rate") or 0)
+        ne_avg = sum(float(row.get("cancellation_rate") or 0) for row in rows) / len(rows)
+        return (
+            f"东北部 {len(rows)} 个州取消率（退货代理指标）已统计。"
+            f"最高为 {top_state}（{top_rate:.2%}），"
+            f"东北部均值 {ne_avg:.2%}，全国 {national_rate:.2%}。"
+        )
+
     used_view_text = "使用了预聚合视图" if sql_plan["used_view"] else "未使用预聚合视图"
     view_text = f"，命中视图 {sql_plan['view_name']}" if sql_plan.get("view_name") else ""
     first_row = rows[0]
@@ -1047,6 +1198,8 @@ def recommend_chart(analysis_type: str, data_analysis: DataAnalysisResult) -> st
 
     if len(data) == 1 and numeric_fields:
         return "big_number_card"
+    if any(key in first for key in ("cancellation_rate", "return_rate", "cancel_rate")):
+        return "bar_chart"
     if any("month" in key or "date" in key or "time" in key for key in first):
         return "line_chart"
     if categorical_fields and numeric_fields:
