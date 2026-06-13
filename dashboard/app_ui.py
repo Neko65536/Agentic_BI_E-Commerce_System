@@ -6,6 +6,7 @@ Streamlit Web UI for Agentic BI E-Commerce System.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 import requests
 import pandas as pd
 import streamlit as st
-from streamlit_chat import message
+import streamlit.components.v1 as components
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -653,41 +654,55 @@ def display_decision_result(result: dict):
     if decision_result:
         with st.expander("🎯 决策建议", expanded=st.session_state.expanded_sections.get("decision", True)):
             if "business_problem" in decision_result:
-                st.markdown(f"**识别的业务问题:** {decision_result['business_problem']}")
-            
+                st.markdown(
+                    f'<div class="decision-card"><div class="decision-action">'
+                    f'📌 {_esc(decision_result["business_problem"])}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
             if "recommendations" in decision_result:
-                st.markdown("**运营建议:**")
+                st.markdown("**运营建议**")
                 for i, rec in enumerate(decision_result["recommendations"][:5], 1):
                     if isinstance(rec, dict):
                         action = rec.get("action") or rec.get("suggestion") or rec.get("recommendation", str(rec))
-                        priority = rec.get("priority", "")
+                        priority = rec.get("priority", "P1")
                         evidence = rec.get("evidence", "")
                         impact = rec.get("expected_impact", "")
-                        if priority:
-                            st.write(f"{i}. **{action}** (优先级: {priority})")
-                        else:
-                            st.write(f"{i}. {action}")
+                        badge = _priority_badge(priority)
+                        meta_parts = []
                         if evidence:
-                            st.caption(f"依据: {evidence}")
+                            meta_parts.append(f"依据：{_esc(evidence)}")
                         if impact:
-                            st.caption(f"预期影响: {impact}")
+                            meta_parts.append(f"预期影响：{_esc(impact)}")
+                        meta_html = "<br>".join(meta_parts)
+                        st.markdown(
+                            f'<div class="decision-card">'
+                            f'<div class="decision-action">{badge}{i}. {_esc(action)}</div>'
+                            f'{"<div class=\"decision-meta\">" + meta_html + "</div>" if meta_html else ""}'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
                     else:
                         st.write(f"{i}. {rec}")
 
             what_if_answer = decision_result.get("what_if_answer")
             if what_if_answer and what_if_answer.get("estimated_lift") is not None:
-                st.markdown("**What-if 量化答案:**")
+                st.markdown("**What-if 量化答案**")
                 st.write(
                     f"评分 {what_if_answer.get('baseline_avg_score')} → "
                     f"{what_if_answer.get('simulated_avg_score')} "
                     f"(+{what_if_answer.get('estimated_lift')})"
                 )
-            
-            if "priority" in decision_result:
-                st.markdown(f"**整体优先级:** {decision_result['priority']}")
-            
-            if "expected_impact" in decision_result:
-                st.markdown(f"**预期影响:** {decision_result['expected_impact']}")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if "priority" in decision_result:
+                    st.metric("整体优先级", decision_result["priority"])
+            with col_b:
+                if decision_result.get("llm_generated"):
+                    st.success("LLM 决策已生成")
+                elif decision_result.get("llm_error"):
+                    st.caption(f"规则兜底：{decision_result['llm_error'][:80]}")
 
 
 def display_sql_result(result: dict):
@@ -715,457 +730,531 @@ def format_time(timestamp_str):
         return ""
 
 
+# 六项业务能力（四类分析 + NLP + What-if）
+ALL_CAPABILITY_CHIPS = [
+    ("descriptive", "描述性", "#2563eb"),
+    ("diagnostic", "诊断性", "#7c3aed"),
+    ("predictive", "预测性", "#0891b2"),
+    ("prescriptive", "规范性", "#059669"),
+    ("nlp", "NLP 评论洞察", "#db2777"),
+    ("what_if", "What-if 模拟", "#ea580c"),
+]
+
+ANALYSIS_TYPE_LABELS = {k: (label, color) for k, label, color in ALL_CAPABILITY_CHIPS if k in {
+    "descriptive", "diagnostic", "predictive", "prescriptive",
+}}
+
+EXTENSION_CAPABILITY_LABELS = {
+    "nlp": ("NLP 评论洞察", "#db2777"),
+    "what_if": ("What-if 模拟", "#ea580c"),
+    "forecast": ("GMV 预测", "#0891b2"),
+}
+
+CHART_TYPE_LABELS = {
+    "line_chart": "折线图",
+    "bar_chart": "柱状图",
+    "geographic_bubble_map": "地理气泡图",
+    "matrix_heatmap": "矩阵热力图",
+    "scatter_bubble_chart": "散点/气泡图",
+    "word_cloud": "词云",
+}
+
+PRIORITY_STYLES = {
+    "P0": ("#dc2626", "#fef2f2", "#fecaca"),
+    "P1": ("#d97706", "#fffbeb", "#fde68a"),
+    "P2": ("#2563eb", "#eff6ff", "#bfdbfe"),
+}
+
+
+def _esc(text: str) -> str:
+    return html.escape(str(text or "")).replace("\n", "<br>")
+
+
+def check_backend_health() -> tuple[bool, str]:
+    result = call_api("health")
+    if result.get("status") == "ok":
+        return True, result.get("version", "1.0.0")
+    return False, ""
+
+
+def _capability_chips_html(chip_keys: list[str] | None = None) -> str:
+    items = ALL_CAPABILITY_CHIPS
+    if chip_keys is not None:
+        key_set = set(chip_keys)
+        items = [item for item in ALL_CAPABILITY_CHIPS if item[0] in key_set]
+    chips = "".join(
+        f'<span class="type-chip" style="--chip-color:{color}">{label}</span>'
+        for _, label, color in items
+    )
+    return f'<div class="chip-row">{chips}</div>'
+
+
+CHAT_BOX_HEIGHT = 680
+CHAT_RESERVE_BOTTOM = 228
+
+CHAT_PANEL_STYLES = """
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; font-family: "Segoe UI", sans-serif; background: transparent; }
+.chat-box {
+    height: 100%; border: 1px solid #cbd5e1; border-radius: 16px; background: #f8fafc;
+    overflow: hidden; box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.04);
+}
+.chat-scroll {
+    height: 100%; min-height: 480px; overflow-y: auto; overflow-x: hidden;
+    padding: 14px 10px 14px 16px; scrollbar-width: thin; scrollbar-color: #64748b #e2e8f0;
+}
+.chat-scroll::-webkit-scrollbar { width: 8px; }
+.chat-scroll::-webkit-scrollbar-track { background: #e2e8f0; border-radius: 4px; margin: 4px 0; }
+.chat-scroll::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; border: 2px solid #e2e8f0; }
+.chat-scroll::-webkit-scrollbar-thumb:hover { background: #64748b; }
+.chat-empty {
+    height: 100%; min-height: 420px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center; color: #64748b;
+}
+.chat-empty-icon { font-size: 40px; margin-bottom: 10px; opacity: 0.85; }
+.chat-empty-title { font-size: 16px; font-weight: 700; color: #334155; margin-bottom: 6px; }
+.chat-empty-desc { font-size: 13px; color: #94a3b8; max-width: 240px; line-height: 1.5; }
+.message-wrapper { display: flex; margin-bottom: 14px; }
+.avatar {
+    width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 15px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+.user-avatar { background: #93c5fd; margin-left: 10px; color: #1e3a8a; }
+.bot-avatar { background: linear-gradient(135deg, #10b981, #059669); margin-right: 10px; }
+.message-bubble {
+    max-width: 88%; padding: 12px 16px; line-height: 1.55; font-size: 14px;
+    word-break: break-word; overflow-wrap: anywhere;
+}
+.user-message-wrapper { justify-content: flex-end; }
+.user-message-bubble {
+    background: #dbeafe; color: #1e3a8a;
+    border: 1px solid #bfdbfe; border-radius: 18px 18px 4px 18px;
+    box-shadow: 0 1px 4px rgba(59, 130, 246, 0.12);
+}
+.bot-message-wrapper { justify-content: flex-start; }
+.bot-message-bubble {
+    background: white; color: #334155; border: 1px solid #e2e8f0;
+    border-radius: 18px 18px 18px 4px; box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+.typing-indicator {
+    display: flex; padding: 12px 16px; background: white; border-radius: 18px;
+    border: 1px solid #e2e8f0; max-width: 100px;
+}
+.typing-dots { display: flex; gap: 5px; }
+.typing-dot {
+    width: 7px; height: 7px; background: #94a3b8; border-radius: 50%;
+    animation: typingBounce 1.4s infinite ease-in-out;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes typingBounce {
+    0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+    40% { transform: scale(1); opacity: 1; }
+}
+"""
+
+
+def _chat_message_html(msg: dict) -> str:
+    content = _esc(msg["content"])
+    if msg["is_user"]:
+        return (
+            f'<div class="message-wrapper user-message-wrapper">'
+            f'<div class="message-bubble user-message-bubble">{content}</div>'
+            f'<div class="avatar user-avatar">👤</div></div>'
+        )
+    return (
+        f'<div class="message-wrapper bot-message-wrapper">'
+        f'<div class="avatar bot-avatar">🤖</div>'
+        f'<div class="message-bubble bot-message-bubble">{content}</div></div>'
+    )
+
+
+def _typing_indicator_html() -> str:
+    return (
+        '<div class="message-wrapper bot-message-wrapper">'
+        '<div class="avatar bot-avatar">🤖</div>'
+        '<div class="typing-indicator"><div class="typing-dots">'
+        '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>'
+        '</div></div></div>'
+    )
+
+
+def build_chat_panel_html(messages: list[dict], is_typing: bool) -> str:
+    inner_parts: list[str] = []
+    if not messages and not is_typing:
+        inner_parts.append(
+            '<div class="chat-empty">'
+            '<div class="chat-empty-icon">💬</div>'
+            '<div class="chat-empty-title">开始对话</div>'
+            '<div class="chat-empty-desc">在下方输入问题，分析结果将展示在右侧</div>'
+            '</div>'
+        )
+    else:
+        for msg in messages:
+            inner_parts.append(_chat_message_html(msg))
+        if is_typing:
+            inner_parts.append(_typing_indicator_html())
+
+    inner = "".join(inner_parts)
+    return f"""
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"><style>{CHAT_PANEL_STYLES}</style></head><body>
+    <div class="chat-box">
+        <div class="chat-scroll" id="chat-scroll-area">{inner}</div>
+    </div>
+    <script>
+        (function() {{
+            const reserveBottom = {CHAT_RESERVE_BOTTOM};
+            function scrollToBottom() {{
+                const el = document.getElementById('chat-scroll-area');
+                if (el) el.scrollTop = el.scrollHeight;
+            }}
+            function fitChatHeight() {{
+                try {{
+                    const frame = window.frameElement;
+                    if (!frame || !window.parent) return;
+                    const parentH = window.parent.innerHeight
+                        || window.parent.document.documentElement.clientHeight;
+                    const top = frame.getBoundingClientRect().top;
+                    const target = Math.max(480, Math.floor(parentH - top - reserveBottom));
+                    frame.style.height = target + 'px';
+                    const box = document.querySelector('.chat-box');
+                    const el = document.getElementById('chat-scroll-area');
+                    if (box) box.style.height = target + 'px';
+                    if (el) el.style.height = Math.max(478, target - 2) + 'px';
+                    scrollToBottom();
+                }} catch (err) {{}}
+            }}
+            fitChatHeight();
+            window.addEventListener('load', fitChatHeight);
+            setTimeout(fitChatHeight, 100);
+            setTimeout(fitChatHeight, 350);
+            if (window.parent) window.parent.addEventListener('resize', fitChatHeight);
+        }})();
+    </script>
+    </body></html>
+    """
+
+
+def render_chat_panel(messages: list[dict], is_typing: bool) -> None:
+    components.html(
+        build_chat_panel_html(messages, is_typing),
+        height=CHAT_BOX_HEIGHT,
+        scrolling=False,
+    )
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="sidebar-brand">
+                <div class="sidebar-logo">BI</div>
+                <div>
+                    <div class="sidebar-title">Agentic BI</div>
+                    <div class="sidebar-subtitle">电商智能分析</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        ok, version = check_backend_health()
+        if ok:
+            st.markdown(
+                f'<div class="status-pill status-ok">● 后端在线 · v{version}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="status-pill status-off">● 后端离线 · 请先启动 backend</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+        st.markdown("**分析能力**")
+        st.markdown(_capability_chips_html(), unsafe_allow_html=True)
+
+        st.markdown("---")
+        if st.button("清空对话", use_container_width=True, type="secondary"):
+            st.session_state.messages = []
+            st.session_state.history_context = []
+            st.session_state.session_id = None
+            st.session_state.pop("last_result", None)
+            st.session_state.last_send_status = None
+            st.session_state.last_error_message = ""
+            st.rerun()
+
+        msg_count = len(st.session_state.messages)
+        st.caption(f"当前会话 · {msg_count} 条消息")
+
+
+def _active_capability_keys(result: dict) -> list[str]:
+    """Return capability chip keys triggered in this answer."""
+    keys: list[str] = []
+    analysis_type = result.get("analysis_type", "")
+    if analysis_type in ANALYSIS_TYPE_LABELS:
+        keys.append(analysis_type)
+    if result.get("forecast_result") and (result["forecast_result"] or {}).get("forecast_values"):
+        if "predictive" not in keys:
+            keys.append("predictive")
+    if result.get("nlp_result") and "nlp" not in keys:
+        keys.append("nlp")
+    if result.get("what_if_result"):
+        keys.append("what_if")
+    return keys
+
+
+def render_analysis_overview(result: dict) -> None:
+    analysis_type = result.get("analysis_type", "")
+    label, color = ANALYSIS_TYPE_LABELS.get(analysis_type, ("未分类", "#64748b"))
+    cols = st.columns(4)
+    cols[0].markdown(
+        f'<div class="overview-card"><div class="overview-label">主分析类型</div>'
+        f'<div class="overview-value" style="color:{color}">{label}</div></div>',
+        unsafe_allow_html=True,
+    )
+    cols[1].markdown(
+        f'<div class="overview-card"><div class="overview-label">返回行数</div>'
+        f'<div class="overview-value">{result.get("row_count", 0):,}</div></div>',
+        unsafe_allow_html=True,
+    )
+    view_text = result.get("view_name") or "原始表"
+    cols[2].markdown(
+        f'<div class="overview-card"><div class="overview-label">数据视图</div>'
+        f'<div class="overview-value overview-sm">{_esc(view_text)}</div></div>',
+        unsafe_allow_html=True,
+    )
+    intent = result.get("intent") or "—"
+    cols[3].markdown(
+        f'<div class="overview-card"><div class="overview-label">业务意图</div>'
+        f'<div class="overview-value overview-sm">{_esc(intent)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    active_keys = _active_capability_keys(result)
+    if active_keys:
+        st.markdown(
+            f'<div class="trigger-row">'
+            f'<span class="trigger-label">本次触发</span>'
+            f'{_capability_chips_html(active_keys)}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _priority_badge(priority: str) -> str:
+    p = (priority or "P1").upper()
+    fg, bg, border = PRIORITY_STYLES.get(p, PRIORITY_STYLES["P1"])
+    return (
+        f'<span class="priority-badge" style="color:{fg};background:{bg};border-color:{border}">{p}</span>'
+    )
+
+
+def inject_global_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            #MainMenu, footer, header { visibility: hidden; }
+            .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px; }
+
+            /* Sidebar */
+            section[data-testid="stSidebar"] {
+                background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+            }
+            section[data-testid="stSidebar"] .stMarkdown,
+            section[data-testid="stSidebar"] label,
+            section[data-testid="stSidebar"] .stCaption { color: #e2e8f0 !important; }
+            section[data-testid="stSidebar"] hr { border-color: #334155; }
+            .sidebar-brand { display: flex; align-items: center; gap: 12px; padding: 8px 0 16px; }
+            .sidebar-logo {
+                width: 44px; height: 44px; border-radius: 12px;
+                background: linear-gradient(135deg, #6366f1, #8b5cf6);
+                color: white; font-weight: 800; font-size: 15px;
+                display: flex; align-items: center; justify-content: center;
+                box-shadow: 0 8px 20px rgba(99, 102, 241, 0.35);
+            }
+            .sidebar-title { font-size: 18px; font-weight: 700; color: #f8fafc; }
+            .sidebar-subtitle { font-size: 12px; color: #94a3b8; margin-top: 2px; }
+            .status-pill {
+                font-size: 12px; padding: 8px 12px; border-radius: 10px; margin-bottom: 4px;
+            }
+            .status-ok { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; }
+            .status-off { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+            .chip-row {
+                display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+            }
+            .trigger-row {
+                display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+                margin: 8px 0 4px;
+            }
+            .trigger-label {
+                font-size: 12px; color: #64748b; white-space: nowrap;
+            }
+            .type-chip {
+                display: inline-block; font-size: 11px; padding: 3px 9px; margin: 0;
+                border-radius: 999px; white-space: nowrap;
+                background: color-mix(in srgb, var(--chip-color) 18%, transparent);
+                color: var(--chip-color); border: 1px solid color-mix(in srgb, var(--chip-color) 35%, transparent);
+            }
+
+            /* Panels */
+            .panel {
+                background: white; border-radius: 18px; padding: 18px 20px;
+                border: 1px solid #e2e8f0; box-shadow: 0 4px 24px rgba(15, 23, 42, 0.06);
+                margin-bottom: 16px;
+            }
+            .panel-header {
+                display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px;
+                color: #0f172a; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid #f1f5f9;
+            }
+            .panel-icon {
+                width: 28px; height: 28px; border-radius: 8px; display: inline-flex;
+                align-items: center; justify-content: center; font-size: 14px;
+                background: linear-gradient(135deg, #eef2ff, #e0e7ff);
+            }
+
+            /* Overview cards */
+            .overview-card {
+                background: white; border: 1px solid #e2e8f0; border-radius: 14px;
+                padding: 14px 16px; min-height: 78px;
+                box-shadow: 0 2px 12px rgba(15, 23, 42, 0.04);
+            }
+            .overview-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+            .overview-value { font-size: 20px; font-weight: 700; color: #0f172a; margin-top: 4px; }
+            .overview-sm { font-size: 13px !important; font-weight: 600 !important; word-break: break-all; }
+
+            /* Status & decisions */
+            .status-success, .status-error {
+                display: inline-block; font-size: 12px; padding: 5px 12px; border-radius: 999px; margin-top: 8px;
+            }
+            .status-success { color: #059669; background: #ecfdf5; border: 1px solid #a7f3d0; }
+            .status-error { color: #dc2626; background: #fef2f2; border: 1px solid #fecaca; }
+            .priority-badge {
+                display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px;
+                border-radius: 6px; border: 1px solid; margin-right: 8px; vertical-align: middle;
+            }
+            .decision-card {
+                background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px;
+                padding: 14px 16px; margin-bottom: 10px;
+            }
+            .decision-action { font-weight: 600; color: #0f172a; line-height: 1.5; }
+            .decision-meta { font-size: 12px; color: #64748b; margin-top: 6px; line-height: 1.5; }
+
+            /* Empty state */
+            .empty-state {
+                text-align: center; padding: 56px 24px; border-radius: 16px;
+                background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+                border: 1px dashed #cbd5e1;
+            }
+            .empty-icon { font-size: 52px; margin-bottom: 12px; opacity: 0.9; }
+            .empty-title { font-size: 18px; font-weight: 700; color: #334155; margin-bottom: 6px; }
+            .empty-desc { font-size: 14px; color: #94a3b8; max-width: 360px; margin: 0 auto; line-height: 1.6; }
+
+            /* Streamlit overrides */
+            div[data-testid="stExpander"] {
+                background: white; border: 1px solid #e2e8f0; border-radius: 14px;
+                box-shadow: 0 2px 12px rgba(15, 23, 42, 0.04); overflow: hidden;
+            }
+            div[data-testid="stExpander"] summary { font-weight: 600; color: #0f172a; }
+            .stButton > button[kind="secondary"] {
+                border-radius: 10px; border-color: #cbd5e1; font-weight: 500;
+            }
+            /* 表单「发送」按钮（覆盖 Streamlit 主题 primary 色） */
+            .stFormSubmitButton button,
+            [data-testid="stFormSubmitButton"] button {
+                border-radius: 10px !important;
+                font-weight: 600 !important;
+                background: #dbeafe !important;
+                background-image: none !important;
+                color: #1d4ed8 !important;
+                border: 1px solid #93c5fd !important;
+                box-shadow: none !important;
+            }
+            .stFormSubmitButton button:hover,
+            [data-testid="stFormSubmitButton"] button:hover {
+                background: #bfdbfe !important;
+                border-color: #60a5fa !important;
+                color: #1e40af !important;
+            }
+            .stFormSubmitButton button:active,
+            [data-testid="stFormSubmitButton"] button:active {
+                background: #93c5fd !important;
+                color: #1e3a8a !important;
+            }
+            button[kind="primaryFormSubmit"],
+            button[kind="secondaryFormSubmit"],
+            .stButton > button[kind="primary"],
+            .stButton > button[data-testid="stBaseButton-primary"] {
+                border-radius: 10px !important;
+                font-weight: 600 !important;
+                background: #dbeafe !important;
+                background-image: none !important;
+                color: #1d4ed8 !important;
+                border: 1px solid #93c5fd !important;
+                box-shadow: none !important;
+            }
+            div[data-testid="stTextInput"] input {
+                border-radius: 12px; border-color: #e2e8f0;
+            }
+            div[data-testid="stTextInput"] input:focus {
+                border-color: #93c5fd; box-shadow: 0 0 0 3px rgba(147, 197, 253, 0.35);
+            }
+            .quick-label { font-size: 12px; font-weight: 600; color: #64748b; margin: 12px 0 6px; }
+
+            @media (max-width: 768px) {
+                .block-container { padding-top: 0.8rem; }
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main():
     """Main Streamlit app entry."""
-    init_session_state()
-    
     st.set_page_config(
         page_title="Agentic BI 电商智能分析系统",
         page_icon="📊",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
-    
-    # Professional CSS styling for chat interface
-    st.markdown("""
-        <style>
-            /* Base styles */
-            * {
-                box-sizing: border-box;
-            }
-            
-            /* Chat container */
-            .chat-container {
-                background: linear-gradient(180deg, #fafbfc 0%, #f1f5f9 100%);
-                border-radius: 20px;
-                padding: 16px;
-                min-height: 200px;
-                max-height: 450px;
-                overflow-y: auto;
-                scrollbar-width: thin;
-                scrollbar-color: #cbd5e1 #e2e8f0;
-                position: relative;
-            }
-            
-            .chat-container::-webkit-scrollbar {
-                width: 6px;
-            }
-            
-            .chat-container::-webkit-scrollbar-track {
-                background: #e2e8f0;
-                border-radius: 3px;
-            }
-            
-            .chat-container::-webkit-scrollbar-thumb {
-                background: #cbd5e1;
-                border-radius: 3px;
-            }
-            
-            /* Message wrapper */
-            .message-wrapper {
-                display: flex;
-                margin-bottom: 12px;
-                animation: fadeInUp 0.3s ease-out;
-            }
-            
-            @keyframes fadeInUp {
-                from {
-                    opacity: 0;
-                    transform: translateY(10px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
-            
-            /* Avatar styling */
-            .avatar {
-                width: 36px;
-                height: 36px;
-                border-radius: 50%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                flex-shrink: 0;
-                font-size: 16px;
-                font-weight: 600;
-                margin-right: 10px;
-                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-            }
-            
-            .user-avatar {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-            }
-            
-            .bot-avatar {
-                background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-                color: white;
-            }
-            
-            /* Message bubble */
-            .message-bubble {
-                max-width: 85%;
-                padding: 12px 16px;
-                border-radius: 20px;
-                position: relative;
-                line-height: 1.5;
-                font-size: 14px;
-                word-wrap: break-word;
-            }
-            
-            /* User message */
-            .user-message-wrapper {
-                justify-content: flex-end;
-            }
-            
-            .user-message-wrapper .avatar {
-                order: 2;
-                margin-right: 0;
-                margin-left: 10px;
-            }
-            
-            .user-message-bubble {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border-radius: 20px 20px 4px 20px;
-                box-shadow: 0 4px 16px rgba(102, 126, 234, 0.35);
-            }
-            
-            .user-message-bubble p {
-                margin: 0;
-                color: rgba(255, 255, 255, 0.95);
-            }
-            
-            /* Bot message */
-            .bot-message-wrapper {
-                justify-content: flex-start;
-            }
-            
-            .bot-message-bubble {
-                background: white;
-                color: #1e293b;
-                border-radius: 20px 20px 20px 4px;
-                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
-                border: 1px solid #e2e8f0;
-            }
-            
-            .bot-message-bubble p {
-                margin: 0;
-                color: #334155;
-            }
-            
-            /* Message metadata */
-            .message-meta {
-                display: flex;
-                align-items: center;
-                margin-top: 4px;
-                font-size: 12px;
-                opacity: 0.7;
-            }
-            
-            .user-message-wrapper .message-meta {
-                justify-content: flex-end;
-            }
-            
-            .bot-message-wrapper .message-meta {
-                justify-content: flex-start;
-            }
-            
-            /* Typing indicator */
-            .typing-indicator {
-                display: flex;
-                align-items: center;
-                padding: 12px 16px;
-                background: white;
-                border-radius: 20px 20px 20px 4px;
-                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
-                max-width: 120px;
-            }
-            
-            .typing-dots {
-                display: flex;
-                gap: 4px;
-            }
-            
-            .typing-dot {
-                width: 8px;
-                height: 8px;
-                background: #94a3b8;
-                border-radius: 50%;
-                animation: typingBounce 1.4s infinite ease-in-out;
-            }
-            
-            .typing-dot:nth-child(1) { animation-delay: 0s; }
-            .typing-dot:nth-child(2) { animation-delay: 0.2s; }
-            .typing-dot:nth-child(3) { animation-delay: 0.4s; }
-            
-            @keyframes typingBounce {
-                0%, 80%, 100% {
-                    transform: scale(0.6);
-                    opacity: 0.5;
-                }
-                40% {
-                    transform: scale(1);
-                    opacity: 1;
-                }
-            }
-            
-            /* Input container */
-            .input-container {
-                background: white;
-                border-radius: 16px;
-                padding: 8px;
-                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-                border: 1px solid #e2e8f0;
-                margin-top: 8px;
-                transition: all 0.3s ease;
-            }
-            
-            .input-container:focus-within {
-                border-color: #667eea;
-                box-shadow: 0 4px 20px rgba(102, 126, 234, 0.2);
-            }
-            
-            /* Send button */
-            .send-btn {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border: none;
-                border-radius: 12px;
-                padding: 12px 24px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.3s ease;
-                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-            }
-            
-            .send-btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
-            }
-            
-            .send-btn:active {
-                transform: translateY(0);
-            }
-            
-            .send-btn:disabled {
-                opacity: 0.6;
-                cursor: not-allowed;
-                transform: none;
-            }
-            
-            /* Status indicators */
-            .status-success {
-                color: #10b981;
-                font-size: 12px;
-                padding: 4px 8px;
-                background: rgba(16, 185, 129, 0.1);
-                border-radius: 10px;
-                display: inline-block;
-                margin-top: 4px;
-            }
-            
-            .status-error {
-                color: #ef4444;
-                font-size: 12px;
-                padding: 4px 8px;
-                background: rgba(239, 68, 68, 0.1);
-                border-radius: 10px;
-                display: inline-block;
-                margin-top: 4px;
-            }
-            
-            /* Section header */
-            .section-header {
-                font-weight: 600;
-                color: #1e293b;
-                padding: 10px 16px;
-                background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
-                border-radius: 12px;
-                margin-bottom: 8px;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-            }
-            
-            /* Result card */
-            .result-card {
-                background: white;
-                border-radius: 16px;
-                padding: 16px;
-                margin-bottom: 8px;
-                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
-                border: 1px solid #e2e8f0;
-                transition: all 0.3s ease;
-            }
-            
-            .result-card:hover {
-                box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
-            }
-            
-            /* Quick question buttons */
-            .quick-question-btn {
-                background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
-                border: 1px solid #cbd5e1;
-                border-radius: 10px;
-                padding: 8px 12px;
-                margin: 2px;
-                cursor: pointer;
-                transition: all 0.2s ease;
-                font-size: 12px;
-                color: #475569;
-            }
-            
-            .quick-question-btn:hover {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                border-color: #667eea;
-                color: white;
-                transform: translateY(-1px);
-            }
-            
-            /* Responsive design */
-            @media (max-width: 768px) {
-                .chat-container {
-                    min-height: 150px;
-                    max-height: 350px;
-                    padding: 12px;
-                }
-                
-                .message-bubble {
-                    max-width: 90%;
-                    padding: 12px 14px;
-                }
-                
-                .avatar {
-                    width: 32px;
-                    height: 32px;
-                    font-size: 14px;
-                }
-            }
-            
-            /* Reduce Streamlit default spacing */
-            .stVerticalBlock {
-                padding-top: 0 !important;
-                padding-bottom: 0 !important;
-            }
-            
-            div[data-testid="stVerticalBlock"] > div {
-                padding-top: 0 !important;
-                padding-bottom: 0 !important;
-            }
-            
-            .stButton > button {
-                margin-top: 0 !important;
-                margin-bottom: 0 !important;
-            }
-            
-            .stForm {
-                padding: 0 !important;
-            }
-            
-            .stColumns {
-                gap: 8px !important;
-            }
-            
-            /* Reduce header spacing */
-            h1 {
-                margin-bottom: 0.5rem !important;
-            }
-            
-            .stMarkdown {
-                margin-bottom: 0 !important;
-            }
-            
-            hr {
-                margin-top: 0.5rem !important;
-                margin-bottom: 0.5rem !important;
-            }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    # Header
-    st.title("📊 Agentic BI 电商智能分析系统")
-    st.markdown("基于大语言模型的电商数据分析智能体系统")
-    st.divider()
-    
-    # Main layout with two columns
-    col1, col2 = st.columns([1, 1.5], gap="large")
-    
+
+    init_session_state()
+    inject_global_styles()
+    render_sidebar()
+
+    col1, col2 = st.columns([1, 1.45], gap="large")
+
     with col1:
-        # Chat section header
-        st.markdown('<div class="section-header"><span>💬</span>对话</div>', unsafe_allow_html=True)
-        
-        # Chat container with styled messages
-        st.markdown('<div class="chat-container" id="chat-messages">', unsafe_allow_html=True)
-        
-        if st.session_state.messages:
-            for i, msg in enumerate(st.session_state.messages):
-                if msg["is_user"]:
-                    # User message with avatar
-                    st.markdown(f'''
-                        <div class="message-wrapper user-message-wrapper">
-                            <div class="message-bubble user-message-bubble">
-                                <p>{msg["content"]}</p>
-                            </div>
-                            <div class="avatar user-avatar">👤</div>
-                        </div>
-                    ''', unsafe_allow_html=True)
-                else:
-                    # Bot message with avatar
-                    st.markdown(f'''
-                        <div class="message-wrapper bot-message-wrapper">
-                            <div class="avatar bot-avatar">🤖</div>
-                            <div class="message-bubble bot-message-bubble">
-                                <p>{msg["content"]}</p>
-                            </div>
-                        </div>
-                    ''', unsafe_allow_html=True)
-        
-        # Typing indicator
-        if st.session_state.is_typing:
-            st.markdown('''
-                <div class="message-wrapper bot-message-wrapper">
-                    <div class="avatar bot-avatar">🤖</div>
-                    <div class="typing-indicator">
-                        <div class="typing-dots">
-                            <span class="typing-dot"></span>
-                            <span class="typing-dot"></span>
-                            <span class="typing-dot"></span>
-                        </div>
-                    </div>
-                </div>
-            ''', unsafe_allow_html=True)
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Status feedback
+        st.markdown(
+            '<div class="panel"><div class="panel-header"><span class="panel-icon">💬</span>智能对话</div>',
+            unsafe_allow_html=True,
+        )
+        render_chat_panel(st.session_state.messages, st.session_state.is_typing)
+
         if st.session_state.last_send_status == "success":
-            st.markdown('<span class="status-success">✓ 发送成功</span>', unsafe_allow_html=True)
+            st.markdown('<span class="status-success">✓ 分析完成</span>', unsafe_allow_html=True)
         elif st.session_state.last_send_status == "error":
-            error_text = st.session_state.last_error_message or "请重试"
-            st.markdown(f'<span class="status-error">✗ 发送失败：{error_text}</span>', unsafe_allow_html=True)
-        
-        # Input area with professional styling
-        st.markdown('<div class="input-container">', unsafe_allow_html=True)
+            error_text = _esc(st.session_state.last_error_message or "请重试")
+            st.markdown(f'<span class="status-error">✗ {error_text}</span>', unsafe_allow_html=True)
+
         with st.form(key="question_form", clear_on_submit=True):
             col_input, col_button = st.columns([4, 1])
-            
             with col_input:
                 user_input = st.text_input(
                     "输入您的问题:",
-                    placeholder="例如：2017年GMV按月趋势如何？",
+                    placeholder="例如：预测未来 6 周 GMV，并给出趋势解读",
                     label_visibility="collapsed",
-                    key="input_text"
+                    key="input_text",
                 )
-            
             with col_button:
                 submit_button = st.form_submit_button(
                     label="发送",
                     use_container_width=True,
-                    type="primary",
-                    disabled=st.session_state.is_typing
+                    type="secondary",
+                    disabled=st.session_state.is_typing,
                 )
 
         if submit_button:
@@ -1176,109 +1265,96 @@ def main():
                 st.session_state.last_send_status = None
 
                 if len(questions) == 1:
-                    with st.spinner("分析中..."):
+                    with st.spinner("Agent 协作分析中，请稍候..."):
                         result = ask_question(questions[0])
-
                     if result:
-                        final_answer = result.get("final_answer", "暂无分析结果")
-                        st.session_state.messages.append({"content": final_answer, "is_user": False})
+                        st.session_state.messages.append({
+                            "content": result.get("final_answer", "暂无分析结果"),
+                            "is_user": False,
+                        })
                         st.session_state.last_result = result
                 else:
                     batch_answers = []
-                    with st.spinner(f"检测到{len(questions)}个问题，正在逐个分析..."):
+                    with st.spinner(f"检测到 {len(questions)} 个问题，逐个分析中..."):
                         for idx, item in enumerate(questions, 1):
                             result = ask_question(item)
                             if not result:
                                 error_text = st.session_state.last_error_message or "未知错误"
                                 batch_answers.append(f"问题{idx}: {item}\n分析失败：{error_text}")
                                 break
-
-                            final_answer = result.get("final_answer", "暂无分析结果")
-                            batch_answers.append(f"问题{idx}: {item}\n{final_answer}")
+                            batch_answers.append(
+                                f"问题{idx}: {item}\n{result.get('final_answer', '暂无分析结果')}"
+                            )
                             st.session_state.last_result = result
-
                     if batch_answers:
-                        st.session_state.messages.append({
-                            "content": "\n\n".join(batch_answers),
-                            "is_user": False,
-                        })
-
+                        st.session_state.messages.append({"content": "\n\n".join(batch_answers), "is_user": False})
                 st.rerun()
             else:
                 st.session_state.last_send_status = "error"
+                st.session_state.last_error_message = "请输入问题"
                 st.rerun()
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Quick questions with improved styling
-        st.markdown('<div style="margin-top: 8px;">', unsafe_allow_html=True)
-        st.markdown("<span style='font-size: 12px; font-weight: 500; color: #64748b;'>快捷问题:</span>", unsafe_allow_html=True)
-        
+
+        st.markdown('<p class="quick-label">快捷提问</p>', unsafe_allow_html=True)
         quick_questions = [
-            "2017年GMV趋势",
+            "2017年GMV按月趋势如何？",
             "各品类销售排名",
-            "客户满意度分析",
-            "预测未来销售额"
+            "预测未来6周GMV",
+            "Top 10 差评品类及原因",
         ]
-        
-        cols = st.columns(2)
+        qcols = st.columns(2)
         for i, q in enumerate(quick_questions):
-            with cols[i % 2]:
+            with qcols[i % 2]:
                 if st.button(q, key=f"quick_{i}", use_container_width=True):
                     st.session_state.messages.append({"content": q, "is_user": True})
                     st.session_state.last_send_status = None
-                    
-                    with st.spinner("分析中..."):
+                    with st.spinner("Agent 协作分析中，请稍候..."):
                         result = ask_question(q)
-                    
                     if result:
-                        final_answer = result.get("final_answer", "暂无分析结果")
-                        st.session_state.messages.append({"content": final_answer, "is_user": False})
+                        st.session_state.messages.append({
+                            "content": result.get("final_answer", "暂无分析结果"),
+                            "is_user": False,
+                        })
                         st.session_state.last_result = result
                         st.rerun()
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-    
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
     with col2:
-        # Results section
-        st.markdown('<div class="section-header"><span>📈</span>分析结果</div>', unsafe_allow_html=True)
-        
+        st.markdown(
+            '<div class="panel"><div class="panel-header"><span class="panel-icon">📈</span>分析结果</div>',
+            unsafe_allow_html=True,
+        )
+
         if "last_result" in st.session_state:
             result = st.session_state.last_result
-            
-            # Summary card
+            render_analysis_overview(result)
+
             if result.get("final_answer"):
                 with st.expander("📋 总结回答", expanded=st.session_state.expanded_sections.get("summary", True)):
-                    st.markdown('<div class="result-card">', unsafe_allow_html=True)
-                    st.markdown(f"<p style='line-height: 1.8; color: #1e293b;'>{result['final_answer']}</p>", unsafe_allow_html=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
-            
-            # SQL result
+                    st.markdown(result["final_answer"])
+
             display_sql_result(result)
-            
-            # Visualization
+
             with st.expander("🎨 可视化图表", expanded=st.session_state.expanded_sections.get("visualization", True)):
                 display_visualization(result)
 
-            # What-if result
             display_what_if_result(result)
-            
-            # NLP result
             display_nlp_result(result)
-            
-            # Forecast result
             display_forecast_result(result)
-            
-            # Decision result
             display_decision_result(result)
         else:
-            st.markdown('<div class="result-card" style="text-align: center; padding: 60px 20px;">', unsafe_allow_html=True)
-            st.markdown("""
-                <div style="font-size: 56px; margin-bottom: 20px;">🔍</div>
-                <h3 style="color: #475569; margin-bottom: 8px;">开始数据分析</h3>
-                <p style="color: #94a3b8; font-size: 14px;">在左侧对话框中输入您的问题，系统将自动进行分析并展示可视化结果</p>
-            """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown(
+                """
+                <div class="empty-state">
+                    <div class="empty-icon">🔍</div>
+                    <div class="empty-title">等待你的第一个问题</div>
+                    <p class="empty-desc">在左侧输入自然语言问题，系统将自动完成 SQL 查询、图表渲染、预测与决策建议</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
