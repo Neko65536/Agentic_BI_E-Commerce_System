@@ -851,22 +851,27 @@ def _trigger_capabilities_html(result: dict) -> str:
     extension = _extension_capability_keys(result)
     if not primary and not extension:
         return ""
-    parts = ['<div class="trigger-block">', '<div class="trigger-heading">本次触发</div>']
+
+    parts = [
+        '<div class="trigger-block">',
+        '<div class="trigger-row trigger-row-inline">',
+        '<span class="trigger-heading">本次触发</span>',
+    ]
     if primary:
         parts.append(
-            '<div class="trigger-row">'
+            '<div class="trigger-group">'
             '<span class="trigger-label">主类型</span>'
             f'{_chips_html_by_keys(ANALYSIS_LAYER_CHIPS, primary)}'
             '</div>'
         )
     if extension:
         parts.append(
-            '<div class="trigger-row">'
+            '<div class="trigger-group">'
             '<span class="trigger-label">增强模块</span>'
             f'{_chips_html_by_keys(EXTENSION_CHIPS, extension)}'
             '</div>'
         )
-    parts.append('</div>')
+    parts.extend(['</div>', '</div>'])
     return "".join(parts)
 
 
@@ -1049,27 +1054,29 @@ def render_sidebar() -> None:
 def render_analysis_overview(result: dict) -> None:
     analysis_type = result.get("analysis_type", "")
     label, color = ANALYSIS_TYPE_LABELS.get(analysis_type, ("未分类", "#64748b"))
-    cols = st.columns(4)
-    cols[0].markdown(
-        f'<div class="overview-card"><div class="overview-label">主分析类型</div>'
-        f'<div class="overview-value" style="color:{color}">{label}</div></div>',
-        unsafe_allow_html=True,
-    )
-    cols[1].markdown(
-        f'<div class="overview-card"><div class="overview-label">返回行数</div>'
-        f'<div class="overview-value">{result.get("row_count", 0):,}</div></div>',
-        unsafe_allow_html=True,
-    )
     view_text = result.get("view_name") or "原始表"
-    cols[2].markdown(
-        f'<div class="overview-card"><div class="overview-label">数据视图</div>'
-        f'<div class="overview-value overview-sm">{_esc(view_text)}</div></div>',
-        unsafe_allow_html=True,
-    )
     intent = result.get("intent") or "—"
-    cols[3].markdown(
-        f'<div class="overview-card"><div class="overview-label">业务意图</div>'
-        f'<div class="overview-value overview-sm">{_esc(intent)}</div></div>',
+    st.markdown(
+        f"""
+        <div class="overview-grid">
+            <div class="overview-card">
+                <div class="overview-label">主分析类型</div>
+                <div class="overview-value" style="color:{color}">{_esc(label)}</div>
+            </div>
+            <div class="overview-card">
+                <div class="overview-label">返回行数</div>
+                <div class="overview-value">{result.get("row_count", 0):,}</div>
+            </div>
+            <div class="overview-card">
+                <div class="overview-label">数据视图</div>
+                <div class="overview-value overview-sm">{_esc(view_text)}</div>
+            </div>
+            <div class="overview-card">
+                <div class="overview-label">业务意图</div>
+                <div class="overview-value overview-sm" title="{_esc(intent)}">{_esc(intent)}</div>
+            </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -1125,8 +1132,16 @@ def inject_global_styles() -> None:
                 font-size: 11px; color: #94a3b8; margin-bottom: 5px; font-weight: 600;
             }
             .trigger-block { margin: 8px 0 4px; }
+            .trigger-row-inline {
+                display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+                margin: 0;
+            }
+            .trigger-group {
+                display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
+            }
+            .trigger-group .chip-row { display: inline-flex; flex-wrap: nowrap; }
             .trigger-heading {
-                font-size: 12px; font-weight: 600; color: #64748b; margin-bottom: 6px;
+                font-size: 12px; font-weight: 600; color: #64748b; white-space: nowrap;
             }
             .trigger-row {
                 display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
@@ -1159,14 +1174,42 @@ def inject_global_styles() -> None:
             }
 
             /* Overview cards */
+            .overview-grid {
+                display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 12px; margin-bottom: 8px;
+            }
             .overview-card {
                 background: white; border: 1px solid #e2e8f0; border-radius: 14px;
-                padding: 14px 16px; min-height: 78px;
+                padding: 14px 16px; height: 96px;
+                display: flex; flex-direction: column;
                 box-shadow: 0 2px 12px rgba(15, 23, 42, 0.04);
+                overflow: hidden;
             }
-            .overview-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
-            .overview-value { font-size: 20px; font-weight: 700; color: #0f172a; margin-top: 4px; }
-            .overview-sm { font-size: 13px !important; font-weight: 600 !important; word-break: break-all; }
+            .overview-label {
+                font-size: 11px; color: #64748b; text-transform: uppercase;
+                letter-spacing: 0.04em; flex-shrink: 0;
+            }
+            .overview-value {
+                font-size: 20px; font-weight: 700; color: #0f172a; margin-top: 6px;
+                flex: 1; min-height: 0; line-height: 1.35;
+                overflow-y: auto; overflow-x: hidden;
+                scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent;
+                padding-right: 2px;
+            }
+            .overview-value::-webkit-scrollbar { width: 4px; }
+            .overview-value::-webkit-scrollbar-track { background: transparent; }
+            .overview-value::-webkit-scrollbar-thumb {
+                background: #cbd5e1; border-radius: 4px;
+            }
+            .overview-value::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+            .overview-sm {
+                font-size: 13px !important; font-weight: 600 !important;
+                word-break: break-all;
+            }
+
+            @media (max-width: 900px) {
+                .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            }
 
             /* Status & decisions */
             .status-success, .status-error {
