@@ -686,13 +686,28 @@ def display_decision_result(result: dict):
                         st.write(f"{i}. {rec}")
 
             what_if_answer = decision_result.get("what_if_answer")
-            if what_if_answer and what_if_answer.get("estimated_lift") is not None:
+            what_if_result = result.get("what_if_result")
+            lift_source = None
+            if isinstance(what_if_answer, dict) and what_if_answer.get("estimated_lift") is not None:
+                lift_source = what_if_answer
+            elif isinstance(what_if_result, dict) and what_if_result.get("estimated_lift") is not None:
+                lift_source = what_if_result
+
+            if lift_source is not None:
                 st.markdown("**What-if 量化答案**")
                 st.write(
-                    f"评分 {what_if_answer.get('baseline_avg_score')} → "
-                    f"{what_if_answer.get('simulated_avg_score')} "
-                    f"(+{what_if_answer.get('estimated_lift')})"
+                    f"评分 {lift_source.get('baseline_avg_score')} → "
+                    f"{lift_source.get('simulated_avg_score')} "
+                    f"(+{lift_source.get('estimated_lift')})"
                 )
+            elif isinstance(what_if_answer, str) and what_if_answer.strip():
+                st.markdown("**What-if 量化答案**")
+                st.write(what_if_answer.strip())
+            elif isinstance(what_if_answer, dict):
+                summary = what_if_answer.get("llm_summary") or what_if_answer.get("summary")
+                if summary:
+                    st.markdown("**What-if 说明**")
+                    st.write(summary)
 
             col_a, col_b = st.columns(2)
             with col_a:
@@ -730,19 +745,20 @@ def format_time(timestamp_str):
         return ""
 
 
-# 六项业务能力（四类分析 + NLP + What-if）
-ALL_CAPABILITY_CHIPS = [
+# 业务能力标签：四层分析 + 增强模块
+ANALYSIS_LAYER_CHIPS = [
     ("descriptive", "描述性", "#2563eb"),
     ("diagnostic", "诊断性", "#7c3aed"),
     ("predictive", "预测性", "#0891b2"),
     ("prescriptive", "规范性", "#059669"),
+]
+
+EXTENSION_CHIPS = [
     ("nlp", "NLP 评论洞察", "#db2777"),
     ("what_if", "What-if 模拟", "#ea580c"),
 ]
 
-ANALYSIS_TYPE_LABELS = {k: (label, color) for k, label, color in ALL_CAPABILITY_CHIPS if k in {
-    "descriptive", "diagnostic", "predictive", "prescriptive",
-}}
+ANALYSIS_TYPE_LABELS = {k: (label, color) for k, label, color in ANALYSIS_LAYER_CHIPS}
 
 EXTENSION_CAPABILITY_LABELS = {
     "nlp": ("NLP 评论洞察", "#db2777"),
@@ -777,11 +793,9 @@ def check_backend_health() -> tuple[bool, str]:
     return False, ""
 
 
-def _capability_chips_html(chip_keys: list[str] | None = None) -> str:
-    items = ALL_CAPABILITY_CHIPS
-    if chip_keys is not None:
-        key_set = set(chip_keys)
-        items = [item for item in ALL_CAPABILITY_CHIPS if item[0] in key_set]
+def _chips_html(items: list[tuple[str, str, str]]) -> str:
+    if not items:
+        return ""
     chips = "".join(
         f'<span class="type-chip" style="--chip-color:{color}">{label}</span>'
         for _, label, color in items
@@ -789,8 +803,74 @@ def _capability_chips_html(chip_keys: list[str] | None = None) -> str:
     return f'<div class="chip-row">{chips}</div>'
 
 
-CHAT_BOX_HEIGHT = 680
-CHAT_RESERVE_BOTTOM = 228
+def _chips_html_by_keys(
+    chip_defs: list[tuple[str, str, str]], keys: list[str],
+) -> str:
+    key_set = set(keys)
+    items = [item for item in chip_defs if item[0] in key_set]
+    return _chips_html(items)
+
+
+def _sidebar_capabilities_html() -> str:
+    return (
+        '<div class="capability-group">'
+        '<div class="capability-group-label">四层分析</div>'
+        f'{_chips_html(ANALYSIS_LAYER_CHIPS)}'
+        '</div>'
+        '<div class="capability-group">'
+        '<div class="capability-group-label">增强能力</div>'
+        f'{_chips_html(EXTENSION_CHIPS)}'
+        '</div>'
+    )
+
+
+def _primary_analysis_keys(result: dict) -> list[str]:
+    """主分析类型（四层之一；若触发预测则追加预测性）。"""
+    keys: list[str] = []
+    analysis_type = result.get("analysis_type", "")
+    if analysis_type in ANALYSIS_TYPE_LABELS:
+        keys.append(analysis_type)
+    forecast = result.get("forecast_result") or {}
+    if forecast.get("forecast_values") and "predictive" not in keys:
+        keys.append("predictive")
+    return keys
+
+
+def _extension_capability_keys(result: dict) -> list[str]:
+    """可选增强模块（NLP / What-if）。"""
+    keys: list[str] = []
+    if result.get("nlp_result"):
+        keys.append("nlp")
+    if result.get("what_if_result"):
+        keys.append("what_if")
+    return keys
+
+
+def _trigger_capabilities_html(result: dict) -> str:
+    primary = _primary_analysis_keys(result)
+    extension = _extension_capability_keys(result)
+    if not primary and not extension:
+        return ""
+    parts = ['<div class="trigger-block">', '<div class="trigger-heading">本次触发</div>']
+    if primary:
+        parts.append(
+            '<div class="trigger-row">'
+            '<span class="trigger-label">主类型</span>'
+            f'{_chips_html_by_keys(ANALYSIS_LAYER_CHIPS, primary)}'
+            '</div>'
+        )
+    if extension:
+        parts.append(
+            '<div class="trigger-row">'
+            '<span class="trigger-label">增强模块</span>'
+            f'{_chips_html_by_keys(EXTENSION_CHIPS, extension)}'
+            '</div>'
+        )
+    parts.append('</div>')
+    return "".join(parts)
+
+
+CHAT_BOX_HEIGHT = 480
 
 CHAT_PANEL_STYLES = """
 * { box-sizing: border-box; }
@@ -800,7 +880,7 @@ html, body { margin: 0; height: 100%; font-family: "Segoe UI", sans-serif; backg
     overflow: hidden; box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.04);
 }
 .chat-scroll {
-    height: 100%; min-height: 480px; overflow-y: auto; overflow-x: hidden;
+    height: 100%; overflow-y: auto; overflow-x: hidden;
     padding: 14px 10px 14px 16px; scrollbar-width: thin; scrollbar-color: #64748b #e2e8f0;
 }
 .chat-scroll::-webkit-scrollbar { width: 8px; }
@@ -808,7 +888,7 @@ html, body { margin: 0; height: 100%; font-family: "Segoe UI", sans-serif; backg
 .chat-scroll::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; border: 2px solid #e2e8f0; }
 .chat-scroll::-webkit-scrollbar-thumb:hover { background: #64748b; }
 .chat-empty {
-    height: 100%; min-height: 420px; display: flex; flex-direction: column;
+    height: 100%; min-height: 200px; display: flex; flex-direction: column;
     align-items: center; justify-content: center; text-align: center; color: #64748b;
 }
 .chat-empty-icon { font-size: 40px; margin-bottom: 10px; opacity: 0.85; }
@@ -905,32 +985,8 @@ def build_chat_panel_html(messages: list[dict], is_typing: bool) -> str:
     </div>
     <script>
         (function() {{
-            const reserveBottom = {CHAT_RESERVE_BOTTOM};
-            function scrollToBottom() {{
-                const el = document.getElementById('chat-scroll-area');
-                if (el) el.scrollTop = el.scrollHeight;
-            }}
-            function fitChatHeight() {{
-                try {{
-                    const frame = window.frameElement;
-                    if (!frame || !window.parent) return;
-                    const parentH = window.parent.innerHeight
-                        || window.parent.document.documentElement.clientHeight;
-                    const top = frame.getBoundingClientRect().top;
-                    const target = Math.max(480, Math.floor(parentH - top - reserveBottom));
-                    frame.style.height = target + 'px';
-                    const box = document.querySelector('.chat-box');
-                    const el = document.getElementById('chat-scroll-area');
-                    if (box) box.style.height = target + 'px';
-                    if (el) el.style.height = Math.max(478, target - 2) + 'px';
-                    scrollToBottom();
-                }} catch (err) {{}}
-            }}
-            fitChatHeight();
-            window.addEventListener('load', fitChatHeight);
-            setTimeout(fitChatHeight, 100);
-            setTimeout(fitChatHeight, 350);
-            if (window.parent) window.parent.addEventListener('resize', fitChatHeight);
+            const el = document.getElementById('chat-scroll-area');
+            if (el) el.scrollTop = el.scrollHeight;
         }})();
     </script>
     </body></html>
@@ -974,7 +1030,7 @@ def render_sidebar() -> None:
 
         st.markdown("---")
         st.markdown("**分析能力**")
-        st.markdown(_capability_chips_html(), unsafe_allow_html=True)
+        st.markdown(_sidebar_capabilities_html(), unsafe_allow_html=True)
 
         st.markdown("---")
         if st.button("清空对话", use_container_width=True, type="secondary"):
@@ -988,22 +1044,6 @@ def render_sidebar() -> None:
 
         msg_count = len(st.session_state.messages)
         st.caption(f"当前会话 · {msg_count} 条消息")
-
-
-def _active_capability_keys(result: dict) -> list[str]:
-    """Return capability chip keys triggered in this answer."""
-    keys: list[str] = []
-    analysis_type = result.get("analysis_type", "")
-    if analysis_type in ANALYSIS_TYPE_LABELS:
-        keys.append(analysis_type)
-    if result.get("forecast_result") and (result["forecast_result"] or {}).get("forecast_values"):
-        if "predictive" not in keys:
-            keys.append("predictive")
-    if result.get("nlp_result") and "nlp" not in keys:
-        keys.append("nlp")
-    if result.get("what_if_result"):
-        keys.append("what_if")
-    return keys
 
 
 def render_analysis_overview(result: dict) -> None:
@@ -1033,15 +1073,9 @@ def render_analysis_overview(result: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    active_keys = _active_capability_keys(result)
-    if active_keys:
-        st.markdown(
-            f'<div class="trigger-row">'
-            f'<span class="trigger-label">本次触发</span>'
-            f'{_capability_chips_html(active_keys)}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    trigger_html = _trigger_capabilities_html(result)
+    if trigger_html:
+        st.markdown(trigger_html, unsafe_allow_html=True)
 
 
 def _priority_badge(priority: str) -> str:
@@ -1085,9 +1119,18 @@ def inject_global_styles() -> None:
             .chip-row {
                 display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
             }
+            .capability-group { margin-bottom: 10px; }
+            .capability-group:last-child { margin-bottom: 0; }
+            .capability-group-label {
+                font-size: 11px; color: #94a3b8; margin-bottom: 5px; font-weight: 600;
+            }
+            .trigger-block { margin: 8px 0 4px; }
+            .trigger-heading {
+                font-size: 12px; font-weight: 600; color: #64748b; margin-bottom: 6px;
+            }
             .trigger-row {
                 display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-                margin: 8px 0 4px;
+                margin: 4px 0;
             }
             .trigger-label {
                 font-size: 12px; color: #64748b; white-space: nowrap;
@@ -1203,6 +1246,14 @@ def inject_global_styles() -> None:
             }
             .quick-label { font-size: 12px; font-weight: 600; color: #64748b; margin: 12px 0 6px; }
 
+            /* 输入区置于聊天 iframe 之上，避免极端缩放下视觉重叠 */
+            .chat-input-block {
+                position: relative;
+                z-index: 2;
+                background: white;
+                padding-top: 8px;
+            }
+
             @media (max-width: 768px) {
                 .block-container { padding-top: 0.8rem; }
             }
@@ -1232,8 +1283,10 @@ def main():
             '<div class="panel"><div class="panel-header"><span class="panel-icon">💬</span>智能对话</div>',
             unsafe_allow_html=True,
         )
-        render_chat_panel(st.session_state.messages, st.session_state.is_typing)
+        with st.container(height=CHAT_BOX_HEIGHT, border=False):
+            render_chat_panel(st.session_state.messages, st.session_state.is_typing)
 
+        st.markdown('<div class="chat-input-block">', unsafe_allow_html=True)
         if st.session_state.last_send_status == "success":
             st.markdown('<span class="status-success">✓ 分析完成</span>', unsafe_allow_html=True)
         elif st.session_state.last_send_status == "error":
@@ -1317,6 +1370,7 @@ def main():
                         st.session_state.last_result = result
                         st.rerun()
 
+        st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col2:

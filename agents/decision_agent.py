@@ -159,6 +159,26 @@ def _normalize_strategy_tiers(
     return normalized
 
 
+def _normalize_what_if_answer(
+    raw: Any,
+    fallback: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Keep structured what-if metrics when LLM returns text or partial JSON."""
+    if isinstance(raw, dict):
+        merged = dict(fallback or {})
+        merged.update({k: v for k, v in raw.items() if v is not None})
+        return merged or None
+
+    if isinstance(raw, str) and raw.strip():
+        if fallback:
+            merged = dict(fallback)
+            merged["llm_summary"] = raw.strip()
+            return merged
+        return {"summary": raw.strip()}
+
+    return fallback
+
+
 def _generate_llm_strategy(
     payload: dict[str, Any],
     visualization_result: dict[str, Any] | None,
@@ -361,8 +381,9 @@ def run_decision_agent(
         recommendations = llm_strategy["recommendations"]
         strategy_tiers = llm_strategy["strategy_tiers"]
         business_problem = llm_strategy["business_problem"]
-        if llm_strategy.get("what_if_answer") is not None:
-            what_if_answer = llm_strategy.get("what_if_answer")
+        llm_what_if = llm_strategy.get("what_if_answer")
+        if llm_what_if is not None:
+            what_if_answer = _normalize_what_if_answer(llm_what_if, what_if_answer)
         priority = llm_strategy["priority"]
         expected_impact = llm_strategy["expected_impact"]
         llm_generated = True
