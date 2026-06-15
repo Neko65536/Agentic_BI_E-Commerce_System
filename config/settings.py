@@ -56,3 +56,4 @@ def ensure_dirs() -> None:
     DATA_RAW.mkdir(parents=True, exist_ok=True)
     DATA_CLEAN.mkdir(parents=True, exist_ok=True)
     (ROOT / "outputs").mkdir(parents=True, exist_ok=True)
+    (ROOT / "outputs" / "chat_sessions").mkdir(parents=True, exist_ok=True)

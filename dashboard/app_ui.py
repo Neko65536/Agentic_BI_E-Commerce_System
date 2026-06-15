@@ -23,6 +23,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dashboard.chat_history_store import (
+    delete_chat,
+    list_chats,
+    load_chat,
+    new_chat_id,
+    save_chat,
+    title_from_messages,
+)
+
 # 从环境变量读取后端端口，默认 3000
 BACKEND_PORT = os.getenv("PORT", "3000")
 API_BASE_URL = f"http://localhost:{BACKEND_PORT}/api"
@@ -39,20 +48,194 @@ def init_session_state():
         st.session_state.history_context = []
     if "expanded_sections" not in st.session_state:
         st.session_state.expanded_sections = {
-            "summary": True,
-            "sql": True,
-            "visualization": True,
-            "what_if": True,
-            "nlp": True,
-            "forecast": True,
-            "decision": True
+            "summary": False,
+            "sql": False,
+            "visualization": False,
+            "what_if": False,
+            "nlp": False,
+            "forecast": False,
+            "decision": False,
         }
+    if not st.session_state.get("_ui_collapsed_v1"):
+        st.session_state.expanded_sections = {
+            key: False for key in st.session_state.expanded_sections
+        }
+        st.session_state._ui_collapsed_v1 = True
     if "is_typing" not in st.session_state:
         st.session_state.is_typing = False
     if "last_send_status" not in st.session_state:
         st.session_state.last_send_status = None
     if "last_error_message" not in st.session_state:
         st.session_state.last_error_message = ""
+    if "current_chat_id" not in st.session_state:
+        st.session_state.current_chat_id = None
+    if "current_chat_created_at" not in st.session_state:
+        st.session_state.current_chat_created_at = None
+
+
+def _format_chat_time(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.strftime("%m-%d %H:%M")
+    except ValueError:
+        return ""
+
+
+def _chat_select_label(chat: dict) -> str:
+    title = str(chat.get("title") or "未命名对话").strip()
+    if len(title) > 22:
+        title = title[:21] + "…"
+    time_text = _format_chat_time(chat.get("updated_at"))
+    msg_count = len(chat.get("messages") or [])
+    active_mark = "● " if chat.get("id") == st.session_state.current_chat_id else ""
+    suffix = f" · {time_text}" if time_text else ""
+    return f"{active_mark}{title}{suffix} · {msg_count}条"
+
+
+def _chat_preview_html(chat: dict) -> str:
+    title = _esc(str(chat.get("title") or "未命名对话"))
+    updated = _esc(_format_chat_time(chat.get("updated_at")) or "—")
+    messages = chat.get("messages") or []
+    msg_count = len(messages)
+    turn_count = sum(1 for msg in messages if msg.get("is_user"))
+    active = chat.get("id") == st.session_state.current_chat_id
+    active_cls = " history-preview-active" if active else ""
+    status = "当前对话" if active else "历史记录"
+    return (
+        f'<div class="history-preview{active_cls}">'
+        f'<div class="history-preview-status">{status}</div>'
+        f'<div class="history-preview-title">{title}</div>'
+        f'<div class="history-preview-meta">'
+        f'<span>{turn_count} 轮提问</span><span>{msg_count} 条消息</span><span>{updated}</span>'
+        f'</div></div>'
+    )
+
+
+def render_chat_history_sidebar() -> None:
+    saved_chats = list_chats()
+    count = len(saved_chats)
+    st.markdown(
+        f'<div class="history-section-header">'
+        f'<span class="sidebar-section-title">历史对话</span>'
+        f'<span class="history-badge">{count}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button("＋ 新建", use_container_width=True, type="primary", key="history_new_chat"):
+            start_new_chat(save_current=True)
+            st.rerun()
+    with action_cols[1]:
+        if st.button("清空当前", use_container_width=True, type="secondary", key="history_clear_chat"):
+            if st.session_state.messages:
+                persist_current_chat()
+            reset_chat_session(keep_chat_id=False)
+            st.rerun()
+
+    if not saved_chats:
+        st.markdown(
+            '<div class="history-empty">暂无历史记录<br><span>提问后将自动保存到这里</span></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    chat_map = {str(chat.get("id")): chat for chat in saved_chats if chat.get("id")}
+    chat_ids = list(chat_map.keys())
+    default_index = 0
+    if st.session_state.current_chat_id in chat_map:
+        default_index = chat_ids.index(st.session_state.current_chat_id)
+
+    selected_id = st.selectbox(
+        "选择历史对话",
+        options=chat_ids,
+        index=default_index,
+        format_func=lambda cid: _chat_select_label(chat_map[cid]),
+        label_visibility="collapsed",
+        key="sidebar_history_select",
+    )
+    st.markdown(_chat_preview_html(chat_map[selected_id]), unsafe_allow_html=True)
+
+    btn_cols = st.columns([3, 1])
+    with btn_cols[0]:
+        if st.button("打开对话", use_container_width=True, type="primary", key="history_open_chat"):
+            if restore_chat(selected_id):
+                st.rerun()
+    with btn_cols[1]:
+        if st.button("删", use_container_width=True, type="secondary", key="history_delete_chat", help="删除选中对话"):
+            delete_chat(selected_id)
+            if st.session_state.current_chat_id == selected_id:
+                reset_chat_session(keep_chat_id=False)
+            st.rerun()
+
+    msg_count = len(st.session_state.messages)
+    if st.session_state.current_chat_id:
+        st.caption(f"当前会话 · {msg_count} 条消息 · 已自动保存")
+    else:
+        st.caption(f"当前会话 · {msg_count} 条消息")
+
+
+def ensure_current_chat_id() -> str:
+    if not st.session_state.current_chat_id:
+        st.session_state.current_chat_id = new_chat_id()
+        st.session_state.current_chat_created_at = datetime.now().isoformat(timespec="seconds")
+    return st.session_state.current_chat_id
+
+
+def persist_current_chat() -> None:
+    if not st.session_state.messages:
+        return
+    chat_id = ensure_current_chat_id()
+    save_chat({
+        "id": chat_id,
+        "title": title_from_messages(st.session_state.messages),
+        "created_at": st.session_state.current_chat_created_at,
+        "session_id": st.session_state.session_id,
+        "messages": st.session_state.messages,
+        "history_context": st.session_state.history_context,
+        "last_result": st.session_state.get("last_result"),
+    })
+
+
+def reset_chat_session(*, keep_chat_id: bool = False) -> None:
+    st.session_state.messages = []
+    st.session_state.history_context = []
+    st.session_state.session_id = None
+    st.session_state.pop("last_result", None)
+    st.session_state.last_send_status = None
+    st.session_state.last_error_message = ""
+    if not keep_chat_id:
+        st.session_state.current_chat_id = None
+        st.session_state.current_chat_created_at = None
+
+
+def start_new_chat(*, save_current: bool = True) -> None:
+    if save_current and st.session_state.messages:
+        persist_current_chat()
+    reset_chat_session(keep_chat_id=False)
+
+
+def restore_chat(chat_id: str) -> bool:
+    if st.session_state.messages and st.session_state.current_chat_id != chat_id:
+        persist_current_chat()
+    data = load_chat(chat_id)
+    if not data:
+        return False
+    st.session_state.current_chat_id = data.get("id")
+    st.session_state.current_chat_created_at = data.get("created_at")
+    st.session_state.session_id = data.get("session_id")
+    st.session_state.messages = list(data.get("messages") or [])
+    st.session_state.history_context = list(data.get("history_context") or [])
+    last_result = data.get("last_result")
+    if last_result:
+        st.session_state.last_result = last_result
+    else:
+        st.session_state.pop("last_result", None)
+    st.session_state.last_send_status = None
+    st.session_state.last_error_message = ""
+    return True
 
 
 def split_questions(raw_text: str) -> list[str]:
@@ -124,7 +307,7 @@ def ask_question(question: str) -> dict | None:
 
 def toggle_section(section_name: str):
     """Toggle section expansion state."""
-    st.session_state.expanded_sections[section_name] = not st.session_state.expanded_sections.get(section_name, True)
+    st.session_state.expanded_sections[section_name] = not st.session_state.expanded_sections.get(section_name, False)
 
 
 def get_chart_rows(result: dict, chart: dict | None = None) -> list:
@@ -150,7 +333,7 @@ def display_visualization(result: dict):
             chart_insight = chart.get("chart_insight", "")
             chart_path = chart.get("chart_path", "")
             
-            with st.expander(f"📊 {chart_title}", expanded=True):
+            with st.expander(f"📊 {chart_title}", expanded=False):
                 if chart_type == "line_chart":
                     display_line_chart(result, chart)
                 elif chart_type == "bar_chart":
@@ -525,7 +708,7 @@ def display_nlp_result(result: dict):
         return
     nlp_result = result.get("nlp_result")
     if nlp_result:
-        with st.expander("💬 NLP分析结果", expanded=st.session_state.expanded_sections.get("nlp", True)):
+        with st.expander("💬 NLP分析结果", expanded=st.session_state.expanded_sections.get("nlp", False)):
             col1, col2 = st.columns(2)
             
             with col1:
@@ -560,7 +743,7 @@ def display_forecast_result(result: dict):
         return
     forecast_result = result.get("forecast_result")
     if forecast_result:
-        with st.expander("📈 预测结果", expanded=st.session_state.expanded_sections.get("forecast", True)):
+        with st.expander("📈 预测结果", expanded=st.session_state.expanded_sections.get("forecast", False)):
             if "forecast_period" in forecast_result:
                 st.markdown(f"**预测周期:** {forecast_result['forecast_period']}")
             
@@ -597,7 +780,7 @@ def display_what_if_result(result: dict):
     if not what_if:
         return
 
-    with st.expander("🔮 What-if 模拟", expanded=st.session_state.expanded_sections.get("what_if", True)):
+    with st.expander("🔮 What-if 模拟", expanded=st.session_state.expanded_sections.get("what_if", False)):
         st.markdown(f"**场景:** {what_if.get('scenario', '卖家干预模拟')}")
 
         col1, col2, col3 = st.columns(3)
@@ -652,7 +835,7 @@ def display_decision_result(result: dict):
     """Display decision/recommendation results with collapsible section."""
     decision_result = result.get("decision_result")
     if decision_result:
-        with st.expander("🎯 决策建议", expanded=st.session_state.expanded_sections.get("decision", True)):
+        with st.expander("🎯 决策建议", expanded=st.session_state.expanded_sections.get("decision", False)):
             if "business_problem" in decision_result:
                 st.markdown(
                     f'<div class="decision-card"><div class="decision-action">'
@@ -722,7 +905,7 @@ def display_decision_result(result: dict):
 
 def display_sql_result(result: dict):
     """Display SQL execution results with collapsible section."""
-    with st.expander("🔍 查询详情", expanded=st.session_state.expanded_sections.get("sql", True)):
+    with st.expander("🔍 查询详情", expanded=st.session_state.expanded_sections.get("sql", False)):
         if result.get("sql"):
             st.markdown("**执行的SQL语句:**")
             st.code(result["sql"], language="sql")
@@ -1038,17 +1221,7 @@ def render_sidebar() -> None:
         st.markdown(_sidebar_capabilities_html(), unsafe_allow_html=True)
 
         st.markdown("---")
-        if st.button("清空对话", use_container_width=True, type="secondary"):
-            st.session_state.messages = []
-            st.session_state.history_context = []
-            st.session_state.session_id = None
-            st.session_state.pop("last_result", None)
-            st.session_state.last_send_status = None
-            st.session_state.last_error_message = ""
-            st.rerun()
-
-        msg_count = len(st.session_state.messages)
-        st.caption(f"当前会话 · {msg_count} 条消息")
+        render_chat_history_sidebar()
 
 
 def render_analysis_overview(result: dict) -> None:
@@ -1131,6 +1304,58 @@ def inject_global_styles() -> None:
             .capability-group-label {
                 font-size: 11px; color: #94a3b8; margin-bottom: 5px; font-weight: 600;
             }
+
+            /* Sidebar history */
+            .sidebar-section-title {
+                font-size: 13px; font-weight: 700; color: #e2e8f0;
+            }
+            .history-section-header {
+                display: flex; align-items: center; justify-content: space-between;
+                margin-bottom: 8px;
+            }
+            .history-badge {
+                display: inline-flex; align-items: center; justify-content: center;
+                min-width: 22px; height: 22px; padding: 0 7px; border-radius: 999px;
+                font-size: 11px; font-weight: 700; color: #bfdbfe;
+                background: rgba(59, 130, 246, 0.18); border: 1px solid rgba(96, 165, 250, 0.25);
+            }
+            .history-empty {
+                margin-top: 6px; padding: 14px 12px; border-radius: 12px; text-align: center;
+                font-size: 12px; color: #cbd5e1; line-height: 1.5;
+                background: rgba(255, 255, 255, 0.04); border: 1px dashed rgba(148, 163, 184, 0.35);
+            }
+            .history-empty span { display: block; margin-top: 4px; color: #94a3b8; font-size: 11px; }
+            .history-preview {
+                margin: 8px 0 10px; padding: 10px 12px; border-radius: 12px;
+                background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(148, 163, 184, 0.18);
+            }
+            .history-preview-active {
+                background: rgba(59, 130, 246, 0.12);
+                border-color: rgba(96, 165, 250, 0.35);
+                box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.08);
+            }
+            .history-preview-status {
+                font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+                color: #93c5fd; text-transform: uppercase; margin-bottom: 4px;
+            }
+            .history-preview-title {
+                font-size: 13px; font-weight: 600; color: #f8fafc; line-height: 1.45;
+                word-break: break-word;
+            }
+            .history-preview-meta {
+                display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px;
+                font-size: 11px; color: #94a3b8;
+            }
+            section[data-testid="stSidebar"] div[data-testid="stSelectbox"] > div {
+                background: rgba(15, 23, 42, 0.55);
+                border-color: rgba(148, 163, 184, 0.28);
+            }
+            section[data-testid="stSidebar"] div[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+                background: rgba(15, 23, 42, 0.55);
+                color: #e2e8f0;
+                border-color: rgba(148, 163, 184, 0.28);
+            }
+
             .trigger-block { margin: 8px 0 4px; }
             .trigger-row-inline {
                 display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
@@ -1384,6 +1609,7 @@ def main():
                             st.session_state.last_result = result
                     if batch_answers:
                         st.session_state.messages.append({"content": "\n\n".join(batch_answers), "is_user": False})
+                persist_current_chat()
                 st.rerun()
             else:
                 st.session_state.last_send_status = "error"
@@ -1411,6 +1637,7 @@ def main():
                             "is_user": False,
                         })
                         st.session_state.last_result = result
+                        persist_current_chat()
                         st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1427,12 +1654,12 @@ def main():
             render_analysis_overview(result)
 
             if result.get("final_answer"):
-                with st.expander("📋 总结回答", expanded=st.session_state.expanded_sections.get("summary", True)):
+                with st.expander("📋 总结回答", expanded=st.session_state.expanded_sections.get("summary", False)):
                     st.markdown(result["final_answer"])
 
             display_sql_result(result)
 
-            with st.expander("🎨 可视化图表", expanded=st.session_state.expanded_sections.get("visualization", True)):
+            with st.expander("🎨 可视化图表", expanded=st.session_state.expanded_sections.get("visualization", False)):
                 display_visualization(result)
 
             display_what_if_result(result)
